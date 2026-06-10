@@ -56,6 +56,7 @@ const game = {
   colliders: [],        // невидимые круги-преграды (корпус корабля и т.п.)
   player: null,         // { obj, x, z, hp, food, energy, warm, ... }
   near: null,
+  fishing: null,        // состояние мини-игры рыбалки
   time: 6 * 60,
   day: 1,
   inventory: {},
@@ -410,6 +411,7 @@ function addEntity(type, x, z, opts = {}) {
   obj.rotation.y = rand(0, Math.PI * 2);
   scene.add(obj);
   const ent = Object.assign({ type, x, z, obj }, e);
+  obj.userData.entity = ent;        // чтобы луч прицела находил сущность по мешу
   game.entities.push(ent);
   return ent;
 }
@@ -537,9 +539,11 @@ const camCtl = { yaw: Math.PI * 0.25, pitch: 0.0, locked: false };
 function setupControls() {
   const el = renderer.domElement;
 
-  // клик по игре — захватить курсор (в отдельной вкладке: бесконечный FPS-обзор)
-  el.addEventListener('click', () => {
-    if (!game.running) return;
+  // ЛКМ — действие по тому, на что наведён прицел (и захват курсора)
+  el.addEventListener('mousedown', e => {
+    if (e.button !== 0 || !game.running) return;
+    if (menuOpen()) return;
+    doAction();
     try { const r = el.requestPointerLock?.(); if (r && r.catch) r.catch(() => {}); } catch (_) {}
   });
   document.addEventListener('pointerlockchange', () => {
@@ -593,7 +597,6 @@ window.addEventListener('keyup', e => { keys[codeToKey(e)] = false; });
 
 function onKeyPress(k) {
   if (!game.running) return;
-  if (k === ' ' || k === 'e') doAction();
   if (k === 'c') toggleCraft();
   if (k === 'i') toggleBag();
   if (k >= '1' && k <= '9') {
@@ -669,41 +672,62 @@ function animatePlayerLimbs(p) {
 /* ====================================================================
    Действия
 ==================================================================== */
+const _raycaster = new THREE.Raycaster();
+const _center = new THREE.Vector2(0, 0);   // центр экрана = прицел
+const REACH = 5;                           // дальность взаимодействия (м)
+
+// поднимаемся по иерархии меша до сущности игры
+function rootEntity(o) {
+  while (o) { if (o.userData && o.userData.entity) return o.userData.entity; o = o.parent; }
+  return null;
+}
+
 function updateNear() {
   const p = game.player;
-  let best = null, bestD = 3.0 * 3.0;
-  for (const e of game.entities) {
-    const d = dist2(p.x, p.z, e.x, e.z);
-    if (d < bestD) { best = e; bestD = d; }
+  _raycaster.setFromCamera(_center, camera);
+  _raycaster.far = REACH;
+
+  // лучом проверяем только объекты поблизости (для скорости)
+  const R2 = (REACH + 3) ** 2;
+  const roots = [];
+  for (const e of game.entities) if (dist2(p.x, p.z, e.x, e.z) < R2) roots.push(e.obj);
+
+  let found = null;
+  for (const h of _raycaster.intersectObjects(roots, true)) {
+    const ent = rootEntity(h.object);
+    if (ent) { found = ent; break; }
   }
-  if (!best) {
-    // вода впереди для рыбалки
-    const fx = p.x + Math.sin(p.dir) * 2.2, fz = p.z + Math.cos(p.dir) * 2.2;
-    if (isWater(fx, fz) && (game.inventory.rod | 0) > 0) {
-      game.near = 'water'; showPrompt('🎣 Пробел — рыбачить'); return;
-    }
+  if (found) { game.near = found; showPrompt(promptFor(found)); return; }
+
+  // рыбалка: прицел смотрит на воду перед собой (если ещё не рыбачим)
+  const fx = p.x + Math.sin(p.dir) * 2.4, fz = p.z + Math.cos(p.dir) * 2.4;
+  if (!game.fishing && isWater(fx, fz) && (game.inventory.rod | 0) > 0) {
+    game.near = 'water'; showPrompt('🎣 ЛКМ — рыбачить'); return;
   }
-  game.near = best;
-  if (best) showPrompt(promptFor(best)); else hidePrompt();
+  game.near = null;
+  if (!game.fishing) hidePrompt();   // во время рыбалки подсказку ведёт updateFishing
 }
 
 function promptFor(e) {
   const hasAxe = (game.inventory.axe | 0) > 0;
   switch (e.type) {
-    case 'tree': return `${hasAxe?'🪓':'✊'} Пробел — рубить дерево`;
-    case 'rock': return '✊ Пробел — добыть камень';
-    case 'bush': return e.berries > 0 ? '🫐 Пробел — собрать ягоды' : '🫐 Ягоды созревают…';
-    case 'grass': return '🌾 Пробел — собрать волокно';
+    case 'tree': return `${hasAxe?'🪓':'✊'} ЛКМ — рубить дерево`;
+    case 'rock': return '✊ ЛКМ — добыть камень';
+    case 'bush': return e.berries > 0 ? '🫐 ЛКМ — собрать ягоды' : '🫐 Ягоды созревают…';
+    case 'grass': return '🌾 ЛКМ — собрать волокно';
     case 'campfire':
-      return (game.inventory.fish|0) > 0 ? '🍤 Пробел — пожарить рыбу' : '🔥 Пробел — подкинуть дров';
+      return (game.inventory.fish|0) > 0 ? '🍤 ЛКМ — пожарить рыбу' : '🔥 ЛКМ — подкинуть дров';
+    case 'fishbite': return '🐟 ЛКМ — подсечь!';
   }
   return '';
 }
 
 function doAction() {
   const p = game.player;
+  // подсечь прыгающую рыбу — мгновенно, без затрат сил
+  if (game.near && game.near.type === 'fishbite') { catchFish(game.near); return; }
   if (p.energy < 4) { log('Слишком устал…'); return; }
-  if (game.near === 'water') { fish(); return; }
+  if (game.near === 'water') { startFishing(); return; }
   if (!game.near) { log('Тут нечего делать.'); return; }
   const e = game.near;
 
@@ -750,11 +774,124 @@ function interactCampfire(fire) {
   log('Нужны дрова, чтобы поддержать огонь.');
 }
 
-function fish() {
-  if ((game.inventory.rod|0) === 0) { log('Нужна удочка 🎣'); return; }
-  const p = game.player; p.energy -= 3; p.swing = 10;
-  if (Math.random() < 0.55) { give('fish', 1); log('🐟 Поймал рыбу!'); }
-  else log('…рыба сорвалась.');
+/* ---- Рыбалка как мини-игра ---- */
+function makeBobber() {
+  const g = new THREE.Group();
+  const top = new THREE.Mesh(new THREE.SphereGeometry(0.12, 8, 8), toon(0xe34b4b));
+  const bot = new THREE.Mesh(new THREE.SphereGeometry(0.12, 8, 8), toon(0xf2efe6));
+  top.position.y = 0.05; bot.position.y = -0.07; bot.scale.y = 0.6;
+  g.add(top, bot);
+  return g;
+}
+function makeFishJumper() {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.SphereGeometry(0.3, 10, 8), toon(0x7fbcd6));
+  body.scale.set(1.6, 0.85, 0.7);
+  const tail = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.32, 6), toon(0x6aa8c4));
+  tail.rotation.z = -Math.PI / 2; tail.position.x = -0.52;
+  const eye = new THREE.Mesh(new THREE.SphereGeometry(0.05, 6, 6), toon(0x20242a));
+  eye.position.set(0.3, 0.09, 0.13);
+  g.add(body, tail, eye);
+  return g;
+}
+
+function startFishing() {
+  if ((game.inventory.rod | 0) === 0) { log('Нужна удочка 🎣'); return; }
+  if (game.fishing) return;
+  const p = game.player;
+  // ищем воду перед собой (в пределах досягаемости прицела)
+  let fx = 0, fz = 0, found = false;
+  for (let dd = 2.4; dd <= 4.0; dd += 0.35) {
+    const x = p.x + Math.sin(p.dir) * dd, z = p.z + Math.cos(p.dir) * dd;
+    if (isWater(x, z)) { fx = x; fz = z; found = true; break; }
+  }
+  if (!found) { log('Подойди ближе к воде.'); return; }
+  p.energy = clamp(p.energy - 2, 0, 100); renderStats();
+  const bob = makeBobber(); bob.position.set(fx, 0.2, fz); scene.add(bob);
+  game.fishing = { state: 'wait', timer: rand(1.2, 2.8), x: fx, z: fz, bob, fishEnt: null, jumpT: 0, jumps: 3 };
+  log('🎣 Закинул удочку… жди поклёвки');
+}
+
+function updateFishing(dt, t) {
+  const f = game.fishing;
+  if (!f) return;
+  if (f.state === 'wait') {
+    f.bob.position.y = 0.2 + Math.sin(t * 4) * 0.04;
+    f.timer -= dt;
+    if (f.timer <= 0) startJump(f);
+    showPrompt('🎣 Жди поклёвки…');
+  } else if (f.state === 'jump') {
+    f.jumpT += dt / 1.15;
+    if (f.jumpT >= 1) { endJump(f); return; }
+    const y = 0.2 + Math.sin(f.jumpT * Math.PI) * 1.4;   // дуга прыжка
+    const obj = f.fishEnt.obj;
+    obj.position.set(f.x, y, f.z);
+    obj.rotation.y = f.dir + Math.PI / 2;
+    obj.rotation.z = (f.jumpT - 0.5) * 2.4;               // переворот в воздухе
+    // подсказка, пока прицел не на рыбе
+    if (game.near !== f.fishEnt) showPrompt('🐟 Лови момент — наведись!');
+  }
+}
+
+function startJump(f) {
+  const fish = makeFishJumper();
+  fish.position.set(f.x, 0.2, f.z);
+  scene.add(fish);
+  const ent = { type: 'fishbite', x: f.x, z: f.z, obj: fish, solid: false };
+  fish.userData.entity = ent;
+  game.entities.push(ent);
+  f.fishEnt = ent; f.dir = game.player.dir; f.jumpT = 0; f.state = 'jump';
+  splash(f.x, f.z);
+}
+
+function endJump(f) {
+  removeFishEnt(f);
+  f.jumps--;
+  if (f.jumps <= 0) { log('…рыба сорвалась.'); endFishing(); }
+  else { f.state = 'wait'; f.timer = rand(0.5, 1.1); }
+}
+
+function removeFishEnt(f) {
+  if (f.fishEnt) { removeEntity(f.fishEnt); f.fishEnt = null; }
+}
+
+function endFishing() {
+  const f = game.fishing;
+  if (!f) return;
+  removeFishEnt(f);
+  if (f.bob) scene.remove(f.bob);
+  game.fishing = null;
+  hidePrompt();
+}
+
+function catchFish() {
+  splash(game.fishing?.x ?? game.player.x, game.fishing?.z ?? game.player.z);
+  give('fish', 1);
+  log('🐟 Поймал рыбу!');
+  endFishing();
+}
+
+// маленький всплеск из частиц-«брызг»
+function splash(x, z) {
+  const mat = toon(0xbfe6ea);
+  for (let i = 0; i < 8; i++) {
+    const drop = new THREE.Mesh(new THREE.SphereGeometry(0.06, 5, 5), mat);
+    drop.position.set(x, 0.2, z);
+    const a = rand(0, 6.28), sp = rand(0.6, 1.4);
+    drop.userData.v = { x: Math.cos(a) * sp, y: rand(1.5, 2.8), z: Math.sin(a) * sp, life: 1 };
+    scene.add(drop);
+    splashDrops.push(drop);
+  }
+}
+const splashDrops = [];
+function updateSplash(dt) {
+  for (let i = splashDrops.length - 1; i >= 0; i--) {
+    const d = splashDrops[i], v = d.userData.v;
+    d.position.x += v.x * dt; d.position.z += v.z * dt;
+    d.position.y += v.y * dt; v.y -= 9 * dt;
+    v.life -= dt * 1.4;
+    if (v.life <= 0 || d.position.y < 0.1) { scene.remove(d); splashDrops.splice(i, 1); }
+  }
 }
 
 /* ====================================================================
@@ -1025,11 +1162,15 @@ function toggleBag() {
   updateCursor();
 }
 
+// открыто ли какое-либо окно (крафт/инвентарь)
+function menuOpen() {
+  return !document.getElementById('craft').classList.contains('hidden')
+      || !document.getElementById('bag').classList.contains('hidden');
+}
+
 // курсор скрыт во время игры (свободный обзор) и виден, когда открыто меню
 function updateCursor() {
-  const menuOpen = !document.getElementById('craft').classList.contains('hidden')
-                || !document.getElementById('bag').classList.contains('hidden');
-  renderer.domElement.style.cursor = (game.running && !menuOpen) ? 'none' : 'default';
+  renderer.domElement.style.cursor = (game.running && !menuOpen()) ? 'none' : 'default';
 }
 function showPrompt(t) { const el = document.getElementById('prompt'); el.textContent = t; el.classList.add('show'); }
 function hidePrompt() { document.getElementById('prompt').classList.remove('show'); }
@@ -1049,9 +1190,11 @@ function loop(ts) {
   if (game.running) {
     movePlayer(dt);
     updateNear();
+    updateFishing(dt, clock);
     updateTime(dt);
     updateStats(dt);
     updateWorld(dt, clock);
+    updateSplash(dt);
     renderClock();
   } else {
     // лёгкое вращение камеры на старте
@@ -1078,6 +1221,7 @@ function loop(ts) {
 ==================================================================== */
 function startGame() {
   // чистим прошлые сущности
+  endFishing();
   for (const e of [...game.entities]) removeEntity(e);
   game.entities = [];
   scatterWorld();
@@ -1127,4 +1271,4 @@ document.getElementById('restart-btn').onclick = startGame;
 requestAnimationFrame(loop);
 
 // debug-хуки (для отладки в превью)
-window.__dbg = { game, camCtl, startGame, THREE, blocked };
+window.__dbg = { game, camCtl, startGame, THREE, blocked, get camera() { return camera; }, updateNear, doAction, startFishing, terrainHeight };
