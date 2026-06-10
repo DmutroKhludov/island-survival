@@ -4,6 +4,7 @@
 ==================================================================== */
 
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 const VW = 896, VH = 576;
 
@@ -52,6 +53,7 @@ function terrainHeight(x, z) {
 const game = {
   running: false,
   entities: [],
+  colliders: [],        // невидимые круги-преграды (корпус корабля и т.п.)
   player: null,         // { obj, x, z, hp, food, energy, warm, ... }
   near: null,
   time: 6 * 60,
@@ -212,6 +214,91 @@ function buildWater() {
   waterMesh.position.y = waterBaseY;
   waterMesh.receiveShadow = false;
   scene.add(waterMesh);
+}
+
+/* ---- Загрузка моделей-пропов (Kenney pirate kit) ---- */
+const gltfLoader = new GLTFLoader();
+
+// находим точку берега вдоль заданного угла (где суша уходит под воду)
+function findShore(angleDeg) {
+  const a = angleDeg * Math.PI / 180;
+  for (let r = 4; r < ISLAND_R + 12; r += 0.5) {
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    if (terrainHeight(x, z) < 0.45) return { x, z, a, r };
+  }
+  return { x: Math.cos(a) * ISLAND_R, z: Math.sin(a) * ISLAND_R, a, r: ISLAND_R };
+}
+
+function loadProps() {
+  // корабль, севший на мель у берега
+  gltfLoader.load('assets/ship-pirate-small.glb', (gltf) => {
+    const ship = gltf.scene;
+    ship.traverse(o => {
+      if (o.isMesh) {
+        o.castShadow = true; o.receiveShadow = true;
+        o.material.side = THREE.DoubleSide;   // паруса — тонкая геометрия
+      }
+    });
+    // нормализуем масштаб: самая длинная сторона ≈ 13 единиц
+    const box = new THREE.Box3().setFromObject(ship);
+    const size = new THREE.Vector3(); box.getSize(size);
+    ship.scale.setScalar(13 / Math.max(size.x, size.y, size.z));
+    const shore = findShore(35);
+    ship.position.set(shore.x, 0.2, shore.z);
+    ship.rotation.y = -shore.a + Math.PI / 2;   // носом вдоль берега
+    ship.rotation.z = 0.07;                      // лёгкий крен «на мели»
+    scene.add(ship);
+    game.ship = ship;
+    buildShipCollision(ship);
+    placePalmsNear(shore);
+  }, undefined, (err) => console.error('ship load error', err));
+}
+
+// строим коллизию по форме корпуса: цепочка кругов вдоль длинной оси
+function buildShipCollision(ship) {
+  // локальные габариты без трансформа (единичная модель)
+  const p = ship.position.clone(), r = ship.rotation.clone(), s = ship.scale.clone();
+  ship.position.set(0,0,0); ship.rotation.set(0,0,0); ship.scale.set(1,1,1);
+  ship.updateMatrixWorld(true);
+  const local = new THREE.Box3().setFromObject(ship);
+  ship.position.copy(p); ship.rotation.copy(r); ship.scale.copy(s);
+  ship.updateMatrixWorld(true);
+
+  const size = new THREE.Vector3(); local.getSize(size);
+  const center = new THREE.Vector3(); local.getCenter(center);
+  const lenAxis = size.x >= size.z ? 'x' : 'z';
+  const lenLocal = Math.max(size.x, size.z);
+  const widthWorld = Math.min(size.x, size.z) * s.x;
+  const rad = Math.max(1.0, widthWorld * 0.4);              // радиус кружков
+  const n = Math.max(2, Math.round(lenLocal * s.x / (rad * 1.2)));
+
+  for (let i = 0; i < n; i++) {
+    const t = (i / (n - 1) - 0.5) * lenLocal * 0.82;        // вдоль киля (локально)
+    const pt = new THREE.Vector3(center.x, 0, center.z);
+    if (lenAxis === 'x') pt.x = center.x + t; else pt.z = center.z + t;
+    pt.applyMatrix4(ship.matrixWorld);                      // в мировые координаты
+    game.colliders.push({ x: pt.x, z: pt.z, r: rad });
+  }
+}
+
+function placePalmsNear(shore) {
+  gltfLoader.load('assets/palm-straight.glb', (gltf) => {
+    for (let i = 0; i < 4; i++) {
+      const palm = gltf.scene.clone(true);
+      palm.traverse(o => { if (o.isMesh) o.castShadow = true; });
+      const box = new THREE.Box3().setFromObject(palm);
+      const size = new THREE.Vector3(); box.getSize(size);
+      palm.scale.setScalar(6 / Math.max(size.x, size.y, size.z));
+      const ang = shore.a + rand(-0.45, 0.45);
+      const rr = shore.r - rand(4, 11);
+      const x = Math.cos(ang) * rr, z = Math.sin(ang) * rr;
+      if (terrainHeight(x, z) < 0.6) continue;
+      palm.position.set(x, terrainHeight(x, z), z);
+      palm.rotation.y = rand(0, 6.28);
+      scene.add(palm);
+      game.colliders.push({ x, z, r: 0.7 });   // коллизия ствола пальмы
+    }
+  });
 }
 
 /* ---- Меши объектов ---- */
@@ -493,6 +580,9 @@ function blocked(x, z) {
   if (isWater(x, z)) return true;
   for (const e of game.entities) {
     if (e.solid && dist2(x, z, e.x, e.z) < (e.r + 0.5) ** 2) return true;
+  }
+  for (const c of game.colliders) {
+    if (dist2(x, z, c.x, c.z) < (c.r + 0.5) ** 2) return true;
   }
   return false;
 }
@@ -991,8 +1081,12 @@ initThree();
 buildTerrain();
 buildWater();
 scatterWorld();
+loadProps();
 initPlayer();
 
 document.getElementById('start-btn').onclick = startGame;
 document.getElementById('restart-btn').onclick = startGame;
 requestAnimationFrame(loop);
+
+// debug-хуки (для отладки в превью)
+window.__dbg = { game, camCtl, startGame, THREE, blocked };

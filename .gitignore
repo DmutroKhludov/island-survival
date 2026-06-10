@@ -12,3 +12,6 @@ Desktop.ini
 
 # Node (на будущее)
 node_modules/
+
+# Локальные настройки Claude Code (только для этой машины)
+.claude/settings.local.json
