@@ -1,0 +1,14 @@
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Editors
+*.swp
+*~
+
+# Logs
+*.log
+
+# Node (на будущее)
+node_modules/

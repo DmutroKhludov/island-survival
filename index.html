@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Островок · ламповая выживалка</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="game-wrap">
+    <div id="game"></div>
+
+    <!-- Верхняя панель статов -->
+    <div id="stats">
+      <div class="stat" title="Здоровье">
+        <span class="ico">❤️</span>
+        <div class="bar"><i id="bar-hp"></i></div>
+      </div>
+      <div class="stat" title="Сытость">
+        <span class="ico">🍖</span>
+        <div class="bar"><i id="bar-food"></i></div>
+      </div>
+      <div class="stat" title="Силы">
+        <span class="ico">⚡</span>
+        <div class="bar"><i id="bar-energy"></i></div>
+      </div>
+      <div class="stat" title="Тепло">
+        <span class="ico">🔥</span>
+        <div class="bar"><i id="bar-warm"></i></div>
+      </div>
+    </div>
+
+    <!-- Часы / день -->
+    <div id="clock">
+      <span id="day-label">День 1</span>
+      <span id="time-label">06:00</span>
+      <span id="phase-label">🌅 Утро</span>
+    </div>
+
+    <!-- Инвентарь -->
+    <div id="inventory"></div>
+
+    <!-- Подсказка действия -->
+    <div id="prompt"></div>
+
+    <!-- Лог сообщений -->
+    <div id="log"></div>
+
+    <!-- Меню крафта -->
+    <div id="craft" class="hidden">
+      <h2>Мастерская <small>(C — закрыть)</small></h2>
+      <div id="craft-list"></div>
+    </div>
+
+    <!-- Инвентарь (полный) -->
+    <div id="bag" class="hidden">
+      <div class="bag-main">
+        <h2>Инвентарь <small>(I — закрыть)</small></h2>
+        <div id="bag-grid" class="grid"></div>
+      </div>
+      <div id="bag-pack" class="bag-pack hidden">
+        <h3>🎒 Рюкзак</h3>
+        <div id="pack-grid" class="grid"></div>
+      </div>
+    </div>
+
+    <!-- Стартовый экран -->
+    <div id="overlay">
+      <div class="card">
+        <h1>🏝️ Островок</h1>
+        <p class="sub">ламповая выживалка</p>
+        <p class="desc">
+          Ты очнулся на маленьком острове. Собирай дерево, камень и ягоды,
+          разведи костёр и переживи ночь. Никакой спешки — просто ты, шум волн
+          и тёплый огонёк.
+        </p>
+        <ul class="keys">
+          <li><b>WASD / стрелки</b> — ходить</li>
+          <li><b>Пробел / E</b> — действие (рубить, собирать, есть у костра)</li>
+          <li><b>C</b> — мастерская (крафт)</li>
+          <li><b>I</b> — инвентарь</li>
+          <li><b>1–9</b> — поставить предмет / использовать</li>
+        </ul>
+        <button id="start-btn">Высадиться на берег</button>
+      </div>
+    </div>
+
+    <!-- Экран смерти -->
+    <div id="gameover" class="hidden">
+      <div class="card">
+        <h1 id="go-title">⛅ Конец</h1>
+        <p id="go-text"></p>
+        <button id="restart-btn">Попробовать снова</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+    }
+  }
+  </script>
+  <script type="module" src="game.js"></script>
+</body>
+</html>
