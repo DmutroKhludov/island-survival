@@ -422,12 +422,24 @@ function removeEntity(e) {
   if (game.near === e) game.near = null;
 }
 
+// визуальный «след» объекта (с учётом кроны/разброса), чтобы они не налезали
+const FOOT = { tree: 2.2, rock: 1.2, bush: 1.0, grass: 0.5, campfire: 1.0 };
+
+// свободно ли место для объекта с footprint footR (круги не должны пересекаться)
+function spaceFree(x, z, footR) {
+  for (const o of game.entities) {
+    const of = FOOT[o.type] ?? o.r;
+    if (dist2(x, z, o.x, o.z) < (footR + of) ** 2) return false;
+  }
+  return true;
+}
+
 function scatterWorld() {
   // деревья / камни / кусты на суше
   let placed = 0, tries = 0;
   const want = { tree: 130, rock: 55, bush: 70, grass: 90 };
   const counts = { tree: 0, rock: 0, bush: 0, grass: 0 };
-  while (tries < 4000 && placed < 330) {
+  while (tries < 9000 && placed < 330) {
     tries++;
     const x = rand(-ISLAND_R, ISLAND_R), z = rand(-ISLAND_R, ISLAND_R);
     const h = terrainHeight(x, z);
@@ -440,14 +452,8 @@ function scatterWorld() {
     else if (r < 0.82 && counts.bush < want.bush) type = 'bush';
     else if (counts.grass < want.grass) type = 'grass';
     else continue;
-    // не ставим вплотную к другим solid
-    let ok = true;
-    if (type === 'tree' || type === 'rock') {
-      for (const o of game.entities) {
-        if (o.solid && dist2(x, z, o.x, o.z) < 4) { ok = false; break; }
-      }
-    }
-    if (!ok) continue;
+    // не ставим, если след пересекается с любым уже стоящим объектом
+    if (!spaceFree(x, z, FOOT[type])) continue;
     addEntity(type, x, z);
     counts[type]++; placed++;
   }
@@ -486,12 +492,24 @@ function makePlayerModel() {
   return g;
 }
 
+// место под игрока должно быть на траве и без объектов рядом
+function playerSpotFree(x, z) {
+  if (terrainHeight(x, z) <= 2) return false;
+  for (const o of game.entities) {
+    if (o.solid && dist2(x, z, o.x, o.z) < (o.r + 1.2) ** 2) return false;
+  }
+  for (const c of game.colliders) {
+    if (dist2(x, z, c.x, c.z) < (c.r + 1.2) ** 2) return false;
+  }
+  return true;
+}
+
 function findSpawn() {
-  // ищем хорошую траву ближе к центру
-  for (let r = 4; r < ISLAND_R; r += 3) {
-    for (let a = 0; a < 360; a += 25) {
+  // ищем хорошую траву ближе к центру, по спирали, без объектов вплотную
+  for (let r = 4; r < ISLAND_R; r += 2) {
+    for (let a = 0; a < 360; a += 12) {
       const x = Math.cos(a*Math.PI/180) * r, z = Math.sin(a*Math.PI/180) * r;
-      if (terrainHeight(x, z) > 2) return { x, z };
+      if (playerSpotFree(x, z)) return { x, z };
     }
   }
   return { x: 0, z: 0 };
@@ -500,6 +518,7 @@ function findSpawn() {
 function initPlayer() {
   const sp = findSpawn();
   const obj = makePlayerModel();
+  obj.visible = false;            // от первого лица собственное тело не показываем
   scene.add(obj);
   game.player = {
     obj, x: sp.x, z: sp.z, dir: 0,
@@ -511,34 +530,45 @@ function initPlayer() {
 }
 
 /* ====================================================================
-   Камера от третьего лица + управление мышью
+   Камера от первого лица + захват мыши (Pointer Lock)
 ==================================================================== */
-const camCtl = { yaw: Math.PI * 0.25, pitch: 0.62, dist: 13, dragging: false, px: 0, py: 0 };
+const EYE_HEIGHT = 1.7;
+const camCtl = { yaw: Math.PI * 0.25, pitch: 0.0, locked: false };
 function setupControls() {
   const el = renderer.domElement;
-  el.addEventListener('mousedown', e => { camCtl.dragging = true; camCtl.px = e.clientX; camCtl.py = e.clientY; });
-  window.addEventListener('mouseup', () => camCtl.dragging = false);
-  window.addEventListener('mousemove', e => {
-    if (!camCtl.dragging) return;
-    camCtl.yaw   -= (e.clientX - camCtl.px) * 0.005;
-    camCtl.pitch  = clamp(camCtl.pitch - (e.clientY - camCtl.py) * 0.004, 0.2, 1.2);
-    camCtl.px = e.clientX; camCtl.py = e.clientY;
+
+  // клик по игре — захватить курсор (в отдельной вкладке: бесконечный FPS-обзор)
+  el.addEventListener('click', () => {
+    if (!game.running) return;
+    try { const r = el.requestPointerLock?.(); if (r && r.catch) r.catch(() => {}); } catch (_) {}
   });
-  el.addEventListener('wheel', e => {
-    e.preventDefault();
-    camCtl.dist = clamp(camCtl.dist + Math.sign(e.deltaY) * 1.2, 7, 22);
-  }, { passive: false });
+  document.addEventListener('pointerlockchange', () => {
+    camCtl.locked = (document.pointerLockElement === el);
+  });
+
+  // свободный обзор: камера крутится от ДВИЖЕНИЯ мыши над игрой, без кнопок.
+  // При захвате курсора события приходят на сам canvas — тот же обработчик.
+  el.addEventListener('mousemove', e => {
+    if (!game.running) return;
+    const k = camCtl.locked ? 0.0024 : 0.004;
+    const mx = clamp(e.movementX || 0, -90, 90);     // отсечь рывки при возврате курсора
+    const my = clamp(e.movementY || 0, -90, 90);
+    camCtl.yaw  -= mx * k;
+    camCtl.pitch = clamp(camCtl.pitch - my * k, -1.35, 1.35);
+  });
 }
 
 function updateCamera() {
   const p = game.player;
-  const tx = p.x, ty = terrainHeight(p.x, p.z) + 1.6, tz = p.z;
-  const cp = Math.cos(camCtl.pitch), sp = Math.sin(camCtl.pitch);
-  const ox = Math.sin(camCtl.yaw) * cp * camCtl.dist;
-  const oz = Math.cos(camCtl.yaw) * cp * camCtl.dist;
-  const oy = sp * camCtl.dist;
-  camera.position.set(tx + ox, ty + oy, tz + oz);
-  camera.lookAt(tx, ty - 0.5, tz);
+  // покачивание головы при ходьбе
+  const bob = (p.moving && game.running) ? Math.sin(p.step * 2) * 0.05 : 0;
+  const ex = p.x, ey = terrainHeight(p.x, p.z) + EYE_HEIGHT + bob, ez = p.z;
+  camera.position.set(ex, ey, ez);
+  const cp = Math.cos(camCtl.pitch);
+  const dx = Math.sin(camCtl.yaw) * cp;
+  const dy = Math.sin(camCtl.pitch);
+  const dz = Math.cos(camCtl.yaw) * cp;
+  camera.lookAt(ex + dx, ey + dy, ez + dz);
 }
 
 /* ====================================================================
@@ -596,9 +626,12 @@ function movePlayer(dt) {
   if (keys['d'] || keys['arrowright']) ix += 1;
   p.moving = (ix || iz) !== 0;
 
+  // смотрим/действуем туда, куда направлен взгляд
+  p.dir = camCtl.yaw;
+
   if (p.moving) {
-    // направления относительно камеры (по горизонтали)
-    const fwd = new THREE.Vector3(); camera.getWorldDirection(fwd); fwd.y = 0; fwd.normalize();
+    // направления относительно взгляда (по горизонтали)
+    const fwd = new THREE.Vector3(Math.sin(camCtl.yaw), 0, Math.cos(camCtl.yaw));
     const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0,1,0)).normalize();
     const mv = new THREE.Vector3()
       .addScaledVector(fwd, iz).addScaledVector(right, ix);
@@ -609,19 +642,13 @@ function movePlayer(dt) {
     if (!blocked(nx, p.z)) p.x = nx;
     if (!blocked(p.x, nz)) p.z = nz;
 
-    p.dir = Math.atan2(mv.x, mv.z);
     p.step += sp * 2.2;
   }
 
-  // позиция и поворот модели
+  // обновляем положение скрытой модели (на случай теней/отладки)
   const gh = terrainHeight(p.x, p.z);
-  const bob = p.moving ? Math.abs(Math.sin(p.step * 2)) * 0.12 : 0;
-  p.obj.position.set(p.x, gh + bob, p.z);
-  // плавный поворот к направлению движения
-  let dy = p.dir - p.obj.rotation.y;
-  while (dy > Math.PI) dy -= Math.PI*2;
-  while (dy < -Math.PI) dy += Math.PI*2;
-  p.obj.rotation.y += dy * 0.2;
+  p.obj.position.set(p.x, gh, p.z);
+  p.obj.rotation.y = p.dir;
 
   animatePlayerLimbs(p);
 }
@@ -988,12 +1015,21 @@ function renderCraft() {
 function toggleCraft() {
   const el = document.getElementById('craft');
   el.classList.toggle('hidden');
-  if (!el.classList.contains('hidden')) renderCraft();
+  if (!el.classList.contains('hidden')) { renderCraft(); document.exitPointerLock(); }
+  updateCursor();
 }
 function toggleBag() {
   const el = document.getElementById('bag');
   el.classList.toggle('hidden');
-  if (!el.classList.contains('hidden')) renderBag();
+  if (!el.classList.contains('hidden')) { renderBag(); document.exitPointerLock(); }
+  updateCursor();
+}
+
+// курсор скрыт во время игры (свободный обзор) и виден, когда открыто меню
+function updateCursor() {
+  const menuOpen = !document.getElementById('craft').classList.contains('hidden')
+                || !document.getElementById('bag').classList.contains('hidden');
+  renderer.domElement.style.cursor = (game.running && !menuOpen) ? 'none' : 'default';
 }
 function showPrompt(t) { const el = document.getElementById('prompt'); el.textContent = t; el.classList.add('show'); }
 function hidePrompt() { document.getElementById('prompt').classList.remove('show'); }
@@ -1056,10 +1092,12 @@ function startGame() {
   renderStats(); renderInventory(); renderClock();
   document.getElementById('overlay').classList.add('hidden');
   document.getElementById('gameover').classList.add('hidden');
+  updateCursor();
   log('🏝️ Ты на острове. Осмотрись.');
 }
 function endGame(won) {
   game.running = false;
+  updateCursor();
   const go = document.getElementById('gameover');
   document.getElementById('go-title').textContent = won ? '🌟 Спасён!' : '💀 Конец пути';
   document.getElementById('go-text').innerHTML = won
