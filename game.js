@@ -712,7 +712,7 @@ window.addEventListener('keyup', e => { keys[codeToKey(e)] = false; });
 function onKeyPress(k) {
   if (!game.running) return;
   if (k === 'c') toggleCraft();
-  if (k === 'i') toggleBag();
+  if (k === 'e' || k === 'i') toggleBag();
   if (k >= '1' && k <= '9') {
     const i = +k - 1;
     if (i < game.hotbar.length) { game.activeSlot = i; useHotbar(i); renderInventory(); }
