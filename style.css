@@ -22,16 +22,17 @@ html, body {
 
 #game-wrap {
   position: relative;
-  width: 896px;
+  width: 100vw;
+  height: 100vh;
   max-width: 100vw;
-  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
-  border-radius: 14px;
+  box-shadow: none;
+  border-radius: 0;
   overflow: hidden;
 }
 
 #game {
   width: 100%;
-  aspect-ratio: 896 / 576;
+  height: 100%;
   background: #f4c79a;
 }
 #game canvas {
