@@ -261,6 +261,9 @@ html, body {
 .bag-pack .grid { grid-template-columns: repeat(3, 52px); }
 .bag-slot { cursor: pointer; }
 .bag-slot:hover { border-color: rgba(247,234,211,0.4); }
+.slot.dragging { opacity: 0.3; }
+.slot.drag-over { border-color: var(--warm) !important; background: rgba(240,194,123,0.22); }
+.slot[draggable="true"] { cursor: grab; }
 
 /* ---- Оверлеи ---- */
 #overlay, #gameover {

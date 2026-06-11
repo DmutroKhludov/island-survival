@@ -11,6 +11,7 @@ const VW = 896, VH = 576;
 // ---- Утилиты ----
 const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 const lerp = (a, b, t) => a + (b - a) * t;
+const smooth01 = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
 const rand = (a, b) => a + Math.random() * (b - a);
 const choice = arr => arr[(Math.random() * arr.length) | 0];
 const dist2 = (ax, az, bx, bz) => { const dx = ax-bx, dz = az-bz; return dx*dx+dz*dz; };
@@ -39,11 +40,15 @@ function fbm(x, z) {
 
 // Аналитическая высота рельефа (метры). Вода на y = 0.
 const ISLAND_R = 58;
+const BEACH_TOP = 1.2;                          // высота, ниже которой — песок
 function terrainHeight(x, z) {
   const d = Math.hypot(x, z) / ISLAND_R;       // 0 центр … 1 берег
   const dome = Math.max(0, 1 - d * d);          // купол суши
   const hills = fbm(x * 0.05 + 10, z * 0.05 + 10);
   let h = dome * 9 + hills * 4 * dome - 1.8;    // края уходят под воду
+  // широкий пологий песчаный пляж: в прибрежном кольце сжимаем перепад высот
+  const beach = smooth01((d - 0.55) / 0.35);   // 0 в глубине острова → 1 у берега
+  h = lerp(h, h * 0.4 + 0.25, beach);
   return h;
 }
 
@@ -60,7 +65,9 @@ const game = {
   time: 6 * 60,
   day: 1,
   inventory: {},
-  hotbar: ['campfire', 'berry', null, null, null],
+  hotbar: [null, null, null, null, null],
+  bagSlots: new Array(16).fill(null),
+  packSlots: new Array(12).fill(null),
   activeSlot: 0,
 };
 
@@ -74,6 +81,7 @@ const ITEMS = {
   wood:     { name: 'Дерево',  icon: '🪵' },
   stone:    { name: 'Камень',  icon: '🪨' },
   berry:    { name: 'Ягоды',   icon: '🫐', food: 14, stam: 12 },
+  coconut:  { name: 'Кокос',   icon: '🥥', food: 18, stam: 8 },
   fish:     { name: 'Рыба',    icon: '🐟', food: 8,  stam: 4 },
   cookedfish:{ name: 'Жареная рыба', icon: '🍤', food: 30, stam: 10 },
   fiber:    { name: 'Волокно', icon: '🌾' },
@@ -141,6 +149,7 @@ function initThree() {
   scene.fog = new THREE.Fog(0xffe2b0, 60, 165);
 
   camera = new THREE.PerspectiveCamera(52, VW / VH, 0.1, 400);
+  scene.add(camera);                 // чтобы предмет-в-руке (ребёнок камеры) рендерился
 
   // солнце (тёплое), мягкая тень
   sun = new THREE.DirectionalLight(0xffd9a0, 1.15);
@@ -161,6 +170,7 @@ function initThree() {
   ambient = new THREE.AmbientLight(0xffd9b0, 0.25);
   scene.add(ambient);
 
+  initHeldItems();
   setupControls();
 }
 
@@ -182,7 +192,8 @@ function buildTerrain() {
     let h = terrainHeight(x, z);
     pos.setY(i, h);
     let c;
-    if (h < 0.6) c = cSand;
+    if (h < BEACH_TOP - 0.3) c = cSand;
+    else if (h < BEACH_TOP + 0.3) c = cSand.clone().lerp(cGrass, (h - (BEACH_TOP - 0.3)) / 0.6);
     else c = cGrass.clone().lerp(cGrassHi, clamp((h - 1) / 7, 0, 1));
     colors.push(c.r, c.g, c.b);
   }
@@ -251,7 +262,9 @@ function loadProps() {
     scene.add(ship);
     game.ship = ship;
     buildShipCollision(ship);
-    placePalmsNear(shore);
+    setupDeck(ship);
+    game.shore = shore;
+    placePalmsNear();
   }, undefined, (err) => console.error('ship load error', err));
 }
 
@@ -282,24 +295,58 @@ function buildShipCollision(ship) {
   }
 }
 
-function placePalmsNear(shore) {
+let palmProto = null;
+function placePalmsNear() {
   gltfLoader.load('assets/palm-straight.glb', (gltf) => {
-    for (let i = 0; i < 4; i++) {
-      const palm = gltf.scene.clone(true);
-      palm.traverse(o => { if (o.isMesh) o.castShadow = true; });
-      const box = new THREE.Box3().setFromObject(palm);
-      const size = new THREE.Vector3(); box.getSize(size);
-      palm.scale.setScalar(6 / Math.max(size.x, size.y, size.z));
-      const ang = shore.a + rand(-0.45, 0.45);
-      const rr = shore.r - rand(4, 11);
-      const x = Math.cos(ang) * rr, z = Math.sin(ang) * rr;
-      if (terrainHeight(x, z) < 0.6) continue;
-      palm.position.set(x, terrainHeight(x, z), z);
-      palm.rotation.y = rand(0, 6.28);
-      scene.add(palm);
-      game.colliders.push({ x, z, r: 0.7 });   // коллизия ствола пальмы
-    }
+    palmProto = gltf.scene;
+    spawnPalms();
   });
+}
+
+// диапазон песчаного пляжа вдоль луча (радиусы: вход в песок → кромка воды)
+function beachSpan(ang) {
+  let rGrass = null, rWater = null;
+  for (let r = 8; r < ISLAND_R + 12; r += 0.4) {
+    const h = terrainHeight(Math.cos(ang) * r, Math.sin(ang) * r);
+    if (rGrass === null && h < BEACH_TOP) rGrass = r;
+    if (rGrass !== null && h < 0.32) { rWater = r; break; }
+  }
+  return { rGrass, rWater };
+}
+
+// пальмы — добываемые объекты: рубятся как дерево и роняют кокосы.
+// Растут по всему песчаному берегу острова.
+function spawnPalms() {
+  if (!palmProto) return;
+  const N = 16;
+  for (let i = 0; i < N; i++) {
+    const ang = (i / N) * Math.PI * 2 + rand(-0.16, 0.16);
+    const { rGrass, rWater } = beachSpan(ang);
+    if (rGrass == null || rWater == null || rWater - rGrass < 1.5) continue;
+    const r = lerp(rGrass, rWater, rand(0.2, 0.65));   // на песке, чуть в глубине от воды
+    const x = Math.cos(ang) * r, z = Math.sin(ang) * r;
+    const gh = terrainHeight(x, z);
+    if (gh < 0.35) continue;
+    if (!spaceFree(x, z, 2.2)) continue;               // не вплотную к другим объектам
+    let nearProp = false;                              // и не внутри корабля
+    for (const c of game.colliders)
+      if (dist2(x, z, c.x, c.z) < (c.r + 1.4) ** 2) { nearProp = true; break; }
+    if (nearProp) continue;
+    const palm = palmProto.clone(true);
+    palm.traverse(o => { if (o.isMesh) o.castShadow = true; });
+    const box = new THREE.Box3().setFromObject(palm);
+    const size = new THREE.Vector3(); box.getSize(size);
+    const sc = 6 / Math.max(size.x, size.y, size.z);
+    palm.scale.setScalar(sc);
+    palm.position.set(x, gh, z);
+    palm.rotation.y = rand(0, 6.28);
+    scene.add(palm);
+    const ent = { type: 'palm', x, z, obj: palm, r: 0.7, hp: 4, solid: true,
+                  keepGeo: true, baseScale: sc, sway: rand(0, 6.28),
+                  coconuts: 2 + (Math.random() * 2 | 0) };
+    palm.userData.entity = ent;             // клон делит геометрию — не диспозим её
+    game.entities.push(ent);
+  }
 }
 
 /* ---- Меши объектов ---- */
@@ -418,7 +465,7 @@ function addEntity(type, x, z, opts = {}) {
 
 function removeEntity(e) {
   scene.remove(e.obj);
-  e.obj.traverse(o => { if (o.geometry) o.geometry.dispose?.(); });
+  if (!e.keepGeo) e.obj.traverse(o => { if (o.geometry) o.geometry.dispose?.(); });
   const i = game.entities.indexOf(e);
   if (i >= 0) game.entities.splice(i, 1);
   if (game.near === e) game.near = null;
@@ -445,7 +492,7 @@ function scatterWorld() {
     tries++;
     const x = rand(-ISLAND_R, ISLAND_R), z = rand(-ISLAND_R, ISLAND_R);
     const h = terrainHeight(x, z);
-    if (h < 0.8) continue;                          // не на воде/пляже-кромке
+    if (h < BEACH_TOP + 0.4) continue;              // ничего не растёт на песке/воде
     // выбираем тип по высоте
     let type;
     const r = Math.random();
@@ -494,6 +541,71 @@ function makePlayerModel() {
   return g;
 }
 
+/* ---- Топор в руке (вид от первого лица) ---- */
+function makeAxeModel() {
+  const g = new THREE.Group();
+  // рукоять
+  const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.03, 0.62, 6), toon(0x8a5a2b));
+  handle.position.y = 0.31;            // низ рукояти (хват) — в начале координат: замах крутится здесь
+  g.add(handle);
+  // обмотка у основания рукояти
+  const grip = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.13, 6), toon(0x49321f));
+  grip.position.y = 0.09;
+  g.add(grip);
+  // лезвие — выгнутый клин (узнаваемый профиль топора), тонкий по Z
+  const blade = new THREE.Shape();
+  blade.moveTo(0, -0.085);
+  blade.lineTo(0, 0.085);
+  blade.lineTo(0.17, 0.135);
+  blade.quadraticCurveTo(0.25, 0, 0.17, -0.135);
+  blade.lineTo(0, -0.085);
+  const bladeGeo = new THREE.ExtrudeGeometry(blade, { depth: 0.05, bevelEnabled: false });
+  bladeGeo.translate(0, 0, -0.025);
+  const bladeMesh = new THREE.Mesh(bladeGeo, toon(0xb9c0c6, { side: THREE.DoubleSide }));
+  bladeMesh.position.set(-0.02, 0.59, 0);
+  bladeMesh.scale.x = -1;                 // остриё смотрит к центру (−X)
+  g.add(bladeMesh);
+  // обух (задняя часть головы) — с внешней стороны
+  const poll = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.13, 0.08), toon(0x868d93));
+  poll.position.set(0.03, 0.59, 0);
+  g.add(poll);
+  g.traverse(o => { if (o.isMesh) { o.castShadow = false; o.receiveShadow = false; } });
+  return g;
+}
+
+// базовая «поза» топора в руке + опорное смещение от камеры
+const AXE_BASE_ROT = { x: 0.1, y: -0.2, z: -0.55 };
+const AXE_BASE_POS = { x: 0.05, y: -0.4, z: -0.55 };
+let heldGroup = null, heldAxe = null;
+function initHeldItems() {
+  heldGroup = new THREE.Group();
+  heldGroup.scale.setScalar(0.55);
+  camera.add(heldGroup);                 // крепим к камере → двигается со взглядом
+  heldAxe = makeAxeModel();
+  heldAxe.rotation.set(AXE_BASE_ROT.x, AXE_BASE_ROT.y, AXE_BASE_ROT.z);
+  heldGroup.add(heldAxe);
+  heldGroup.visible = false;
+}
+
+// показываем топор, если он выбран в хотбаре; анимируем покачивание и замах
+function updateHeld() {
+  if (!heldGroup) return;
+  const p = game.player;
+  const show = game.running && p && !menuOpen()
+            && game.hotbar[game.activeSlot] === 'axe' && (game.inventory.axe | 0) > 0;
+  heldGroup.visible = show;
+  if (!show) return;
+  const bob = p.moving ? Math.sin(p.step * 2) * 0.014 : 0;
+  const sway = p.moving ? Math.cos(p.step) * 0.012 : 0;
+  // замах: p.swing 12→0 после удара, плавная дуга «вниз-к-центру»
+  const s = clamp(p.swing / 12, 0, 1);
+  const chop = Math.sin(s * Math.PI);
+  heldGroup.position.set(AXE_BASE_POS.x + sway, AXE_BASE_POS.y + bob, AXE_BASE_POS.z);
+  heldAxe.rotation.set(AXE_BASE_ROT.x + chop * 0.35,
+                       AXE_BASE_ROT.y,
+                       AXE_BASE_ROT.z + chop * 1.25);
+}
+
 // место под игрока должно быть на траве и без объектов рядом
 function playerSpotFree(x, z) {
   if (terrainHeight(x, z) <= 2) return false;
@@ -524,6 +636,7 @@ function initPlayer() {
   scene.add(obj);
   game.player = {
     obj, x: sp.x, z: sp.z, dir: 0,
+    y: terrainHeight(sp.x, sp.z), mode: 'ground', ladder: null,
     speed: 7.5, moving: false,
     hp: 100, food: 100, energy: 100, warm: 100,
     swing: 0, step: 0,
@@ -566,7 +679,8 @@ function updateCamera() {
   const p = game.player;
   // покачивание головы при ходьбе
   const bob = (p.moving && game.running) ? Math.sin(p.step * 2) * 0.05 : 0;
-  const ex = p.x, ey = terrainHeight(p.x, p.z) + EYE_HEIGHT + bob, ez = p.z;
+  const feet = (p.y !== undefined) ? p.y : terrainHeight(p.x, p.z);
+  const ex = p.x, ey = feet + EYE_HEIGHT + bob, ez = p.z;
   camera.position.set(ex, ey, ez);
   const cp = Math.cos(camCtl.pitch);
   const dx = Math.sin(camCtl.yaw) * cp;
@@ -620,6 +734,111 @@ function blocked(x, z) {
   return false;
 }
 
+/* ====================================================================
+   Лестницы и палуба корабля (лазание + ходьба по палубе)
+==================================================================== */
+const CLIMB_SPEED = 3.2;          // м/с по лестнице
+const LADDER_GRAB = 1.2;          // радиус «захвата» лестницы у основания
+const _UP = new THREE.Vector3(0, 1, 0);
+
+function makeLadder(height) {
+  const g = new THREE.Group();
+  const railMat = toon(0x9c6b3f), rungMat = toon(0x7a5230);
+  const railGeo = new THREE.BoxGeometry(0.09, height, 0.09);
+  const railL = new THREE.Mesh(railGeo, railMat); railL.position.set(-0.3, height / 2, 0);
+  const railR = new THREE.Mesh(railGeo, railMat); railR.position.set(0.3, height / 2, 0);
+  g.add(railL, railR);
+  const n = Math.max(2, Math.round(height / 0.42));
+  const rungGeo = new THREE.BoxGeometry(0.72, 0.08, 0.08);
+  for (let i = 0; i <= n; i++) {
+    const r = new THREE.Mesh(rungGeo, rungMat);
+    r.position.set(0, (i / n) * height, 0.03);
+    g.add(r);
+  }
+  g.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+  return g;
+}
+
+// палуба + две лестницы по бортам; вызывается один раз после загрузки корабля
+function setupDeck(ship) {
+  const box = new THREE.Box3().setFromObject(ship);
+  const c = new THREE.Vector3(); box.getCenter(c);
+  const ry = ship.rotation.y, deckY = 3.0;
+  const cos = Math.cos(ry), sin = Math.sin(ry);
+  const c2w = (lx, lz) => ({ x: c.x + lx * cos - lz * sin, z: c.z + lx * sin + lz * cos });
+  const D = {
+    cx: c.x, cz: c.z, ry, deckY,
+    lxMin: -4.7, lxMax: 2.7, lzMin: -2.7, lzMax: 2.7,   // ходимая палуба (локальные оси)
+    ladders: [],
+  };
+  game.deck = D;
+  // настройки бортов: lx вдоль киля, baseLz — линия лестницы у борта,
+  // deckLz — выход на палубу (внутрь), inset — прижать меш к корпусу
+  const cfgs = [
+    { lx: 0,  baseLz: 3.2,  deckLz: 2.4,  inset: 0 },     // борт A (у мачты)
+    { lx: -2, baseLz: -2.9, deckLz: -2.1, inset: 0.22 },  // борт B (прижата к корпусу)
+  ];
+  for (const cfg of cfgs) {
+    const b = c2w(cfg.lx, cfg.baseLz);   // низ лестницы (борт)
+    const t = c2w(cfg.lx, cfg.deckLz);   // точка выхода на палубу
+    const baseY = Math.max(0.2, terrainHeight(b.x, b.z));
+    let nx = b.x - t.x, nz = b.z - t.z; const nl = Math.hypot(nx, nz) || 1; nx /= nl; nz /= nl;
+    const L = { bx: b.x, bz: b.z, tx: t.x, tz: t.z, nx, nz, baseY, topY: deckY };
+    D.ladders.push(L);
+    const lad = makeLadder(deckY - baseY + 0.15);
+    lad.position.set(b.x - nx * cfg.inset, baseY, b.z - nz * cfg.inset);  // прижать к борту
+    lad.rotation.y = ry + Math.PI / 2;   // плоскостью к борту (перекладины горизонтально)
+    scene.add(lad);
+    L.mesh = lad;
+  }
+}
+
+function nearestLadder(x, z, maxD) {
+  if (!game.deck) return null;
+  let best = null, bd = maxD * maxD;
+  for (const L of game.deck.ladders) {
+    const d = dist2(x, z, L.bx, L.bz);
+    if (d < bd) { bd = d; best = L; }
+  }
+  return best;
+}
+
+// за пределами прямоугольника палубы (локальные оси корабля)?
+function deckBlocked(x, z) {
+  const D = game.deck;
+  const dx = x - D.cx, dz = z - D.cz;
+  const lx = dx * Math.cos(D.ry) + dz * Math.sin(D.ry);
+  const lz = -dx * Math.sin(D.ry) + dz * Math.cos(D.ry);
+  return lx < D.lxMin || lx > D.lxMax || lz < D.lzMin || lz > D.lzMax;
+}
+
+// движение по лестнице: W — вверх, S — вниз; x,z примагничены к лестнице
+function climbMove(p, dt, iz) {
+  const L = p.ladder;
+  p.x = L.bx; p.z = L.bz;
+  p.y = clamp(p.y + iz * CLIMB_SPEED * dt, L.baseY, L.topY);
+  p.moving = iz !== 0;
+  p.step += Math.abs(iz) * dt * 4;
+  if (p.y >= L.topY - 0.03) {            // наверх — шаг на палубу
+    p.x = L.tx; p.z = L.tz; p.y = game.deck.deckY; p.mode = 'deck'; p.ladder = null;
+  } else if (p.y <= L.baseY + 0.03 && iz < 0) {   // вниз — на землю
+    p.y = terrainHeight(p.x, p.z); p.mode = 'ground'; p.ladder = null;
+  }
+  p.obj.position.set(p.x, p.y, p.z);
+  p.obj.rotation.y = p.dir;
+  animatePlayerLimbs(p);
+}
+
+// на палубе у края лестницы и жмём «вниз» → начать спуск
+function tryDescend(p) {
+  for (const L of game.deck.ladders) {
+    if (dist2(p.x, p.z, L.tx, L.tz) < 1.2 * 1.2 && (keys['s'] || keys['arrowdown'])) {
+      p.mode = 'climb'; p.ladder = L; p.x = L.bx; p.z = L.bz; p.y = L.topY - 0.12;
+      return;
+    }
+  }
+}
+
 function movePlayer(dt) {
   const p = game.player;
   let ix = 0, iz = 0;
@@ -627,32 +846,39 @@ function movePlayer(dt) {
   if (keys['s'] || keys['arrowdown'])  iz -= 1;
   if (keys['a'] || keys['arrowleft'])  ix -= 1;
   if (keys['d'] || keys['arrowright']) ix += 1;
-  p.moving = (ix || iz) !== 0;
-
-  // смотрим/действуем туда, куда направлен взгляд
   p.dir = camCtl.yaw;
 
+  if (p.mode === 'climb') { climbMove(p, dt, iz); return; }
+
+  p.moving = (ix || iz) !== 0;
+  let nx = p.x, nz = p.z;
   if (p.moving) {
-    // направления относительно взгляда (по горизонтали)
     const fwd = new THREE.Vector3(Math.sin(camCtl.yaw), 0, Math.cos(camCtl.yaw));
-    const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0,1,0)).normalize();
-    const mv = new THREE.Vector3()
-      .addScaledVector(fwd, iz).addScaledVector(right, ix);
+    const right = new THREE.Vector3().crossVectors(fwd, _UP).normalize();
+    const mv = new THREE.Vector3().addScaledVector(fwd, iz).addScaledVector(right, ix);
     if (mv.lengthSq() > 0) mv.normalize();
-
     const sp = p.speed * (p.energy < 12 ? 0.55 : 1) * dt;
-    const nx = p.x + mv.x * sp, nz = p.z + mv.z * sp;
-    if (!blocked(nx, p.z)) p.x = nx;
-    if (!blocked(p.x, nz)) p.z = nz;
-
+    nx = p.x + mv.x * sp; nz = p.z + mv.z * sp;
     p.step += sp * 2.2;
   }
 
-  // обновляем положение скрытой модели (на случай теней/отладки)
-  const gh = terrainHeight(p.x, p.z);
-  p.obj.position.set(p.x, gh, p.z);
-  p.obj.rotation.y = p.dir;
+  if (p.mode === 'deck') {
+    if (!deckBlocked(nx, p.z)) p.x = nx;
+    if (!deckBlocked(p.x, nz)) p.z = nz;
+    p.y = game.deck.deckY;
+    tryDescend(p);
+  } else {
+    if (!blocked(nx, p.z)) p.x = nx;
+    if (!blocked(p.x, nz)) p.z = nz;
+    p.y = terrainHeight(p.x, p.z);
+    const L = nearestLadder(p.x, p.z, LADDER_GRAB);
+    if (L && (keys['w'] || keys['arrowup'])) {     // у основания и жмём вверх → лезем
+      p.mode = 'climb'; p.ladder = L; p.x = L.bx; p.z = L.bz; p.y = Math.max(p.y, L.baseY);
+    }
+  }
 
+  p.obj.position.set(p.x, p.y, p.z);
+  p.obj.rotation.y = p.dir;
   animatePlayerLimbs(p);
 }
 
@@ -682,8 +908,28 @@ function rootEntity(o) {
   return null;
 }
 
+// подсказки по лестнице (имеют приоритет; вызывается после updateNear)
+function updateLadderPrompt() {
+  const p = game.player;
+  if (!game.deck || !game.running) return;
+  if (p.mode === 'climb') { game.near = null; showPrompt('⬆ W вверх · ⬇ S вниз'); return; }
+  if (p.mode === 'deck') {
+    for (const L of game.deck.ladders)
+      if (dist2(p.x, p.z, L.tx, L.tz) < 1.3 * 1.3) { showPrompt('⬇ S — спуститься'); return; }
+    return;
+  }
+  const L = nearestLadder(p.x, p.z, LADDER_GRAB);
+  if (L) showPrompt('⬆ W — взобраться');
+}
+
 function updateNear() {
   const p = game.player;
+  // во время лазания / на палубе обычные взаимодействия не нужны
+  if (p.mode === 'climb' || p.mode === 'deck') {
+    game.near = null;
+    if (!game.fishing) hidePrompt();
+    return;
+  }
   _raycaster.setFromCamera(_center, camera);
   _raycaster.far = REACH;
 
@@ -712,6 +958,7 @@ function promptFor(e) {
   const hasAxe = (game.inventory.axe | 0) > 0;
   switch (e.type) {
     case 'tree': return `${hasAxe?'🪓':'✊'} ЛКМ — рубить дерево`;
+    case 'palm': return `${hasAxe?'🪓':'✊'} ЛКМ — срубить пальму`;
     case 'rock': return '✊ ЛКМ — добыть камень';
     case 'bush': return e.berries > 0 ? '🫐 ЛКМ — собрать ягоды' : '🫐 Ягоды созревают…';
     case 'grass': return '🌾 ЛКМ — собрать волокно';
@@ -744,6 +991,18 @@ function doAction() {
       give('wood', (rand(2,4)|0) + 2);
       if (Math.random() < 0.5) give('fiber', 1);
       removeEntity(e); log('🪵 Срубил дерево');
+    }
+  } else if (e.type === 'palm') {
+    e.hp -= hasAxe ? 2 : 1;
+    p.energy -= 3;
+    popEntity(e);
+    if (e.hp <= 0) {
+      const n = e.coconuts, px = e.x, pz = e.z;
+      give('wood', (rand(1,3)|0) + 1);
+      removeEntity(e);
+      log('🌴 Срубил пальму — кокосы упали на землю');
+      for (let k = 0; k < n; k++)
+        dropPickup('coconut', px + rand(-0.6, 0.6), pz + rand(-0.6, 0.6), 3);
     }
   } else if (e.type === 'rock') {
     e.hp -= 1; p.energy -= 4; popEntity(e);
@@ -894,18 +1153,104 @@ function updateSplash(dt) {
   }
 }
 
+/* ---- Упавшие предметы (кокосы): лежат на земле, подбираются при подходе ---- */
+function makeCoconut() {
+  const g = new THREE.Group();
+  const shell = new THREE.Mesh(new THREE.IcosahedronGeometry(0.2, 1), toon(0x7a4a28));
+  shell.castShadow = true;
+  g.add(shell);
+  const spot = new THREE.Mesh(new THREE.SphereGeometry(0.07, 6, 6), toon(0xc8a06a));
+  spot.position.set(0.08, 0.12, 0.05);
+  g.add(spot);
+  return g;
+}
+const pickups = [];
+function dropPickup(item, x, z, fromY) {
+  const obj = makeCoconut();
+  obj.position.set(x, fromY, z);
+  scene.add(obj);
+  const a = rand(0, 6.28), spd = rand(0.7, 1.7);
+  pickups.push({ obj, item, x, z, y: fromY,
+    vx: Math.cos(a) * spd, vz: Math.sin(a) * spd, vy: rand(1.5, 3),
+    landed: false, bob: rand(0, 6.28) });
+}
+// хватит ли места под предмет (чтобы не спамить «переполнено» у лежащего кокоса)
+function canTake(item) {
+  if (findItemSlot(item)) return true;
+  if (game.hotbar.includes(null) || game.bagSlots.includes(null)) return true;
+  if (hasBackpack() && game.packSlots.includes(null)) return true;
+  return false;
+}
+function updatePickups(dt, t) {
+  const p = game.player;
+  for (let i = pickups.length - 1; i >= 0; i--) {
+    const d = pickups[i];
+    if (!d.landed) {
+      d.x += d.vx * dt; d.z += d.vz * dt;
+      d.y += d.vy * dt; d.vy -= 9 * dt;
+      const gh = terrainHeight(d.x, d.z) + 0.22;
+      if (d.y <= gh) { d.y = gh; d.landed = true; }
+      d.obj.position.set(d.x, d.y, d.z);
+      d.obj.rotation.x += dt * 5; d.obj.rotation.z += dt * 4;
+    } else {
+      const gh = terrainHeight(d.x, d.z) + 0.24;
+      d.obj.position.y = gh + Math.sin(t * 3 + d.bob) * 0.06;   // мягкое покачивание
+      d.obj.rotation.y += dt * 1.4;
+      if (game.running && p && dist2(p.x, p.z, d.x, d.z) < 1.6 * 1.6 && canTake(d.item)) {
+        give(d.item, 1);
+        log(`${ITEMS[d.item].icon} Подобрал ${ITEMS[d.item].name}`);
+        removePickup(i);
+      }
+    }
+  }
+}
+function removePickup(i) {
+  const d = pickups[i];
+  scene.remove(d.obj);
+  d.obj.traverse(o => { if (o.geometry) o.geometry.dispose?.(); });
+  pickups.splice(i, 1);
+}
+function clearPickups() {
+  for (let i = pickups.length - 1; i >= 0; i--) removePickup(i);
+}
+
 /* ====================================================================
    Инвентарь / крафт
 ==================================================================== */
 function hasBackpack() { return (game.inventory.backpack | 0) > 0; }
-function capacity() { return BAG_SLOTS + (hasBackpack() ? PACK_SLOTS : 0); }
-function stackCount() {
-  return Object.keys(game.inventory).filter(k => k !== 'backpack' && (game.inventory[k]|0) > 0).length;
+
+function findItemSlot(item) {
+  let i = game.hotbar.indexOf(item);
+  if (i >= 0) return { arr: 'hotbar', idx: i };
+  i = game.bagSlots.indexOf(item);
+  if (i >= 0) return { arr: 'bag', idx: i };
+  i = game.packSlots.indexOf(item);
+  if (i >= 0) return { arr: 'pack', idx: i };
+  return null;
 }
+function getSlotArray(name) {
+  if (name === 'hotbar') return game.hotbar;
+  if (name === 'bag') return game.bagSlots;
+  return game.packSlots;
+}
+function cleanupSlots() {
+  const clean = arr => { for (let i = 0; i < arr.length; i++) if (arr[i] && (game.inventory[arr[i]]|0) <= 0) arr[i] = null; };
+  clean(game.hotbar); clean(game.bagSlots); clean(game.packSlots);
+}
+
 function give(item, n = 1) {
   n = Math.max(1, n | 0);
-  if (item !== 'backpack' && (game.inventory[item]|0) === 0 && stackCount() >= capacity()) {
-    log('🎒 Инвентарь переполнен!'); return false;
+  if (item === 'backpack') {
+    game.inventory[item] = (game.inventory[item]|0) + n;
+    renderInventory(); return true;
+  }
+  if (!findItemSlot(item)) {
+    let placed = false, fi;
+    fi = game.hotbar.indexOf(null);
+    if (fi >= 0) { game.hotbar[fi] = item; placed = true; }
+    if (!placed) { fi = game.bagSlots.indexOf(null); if (fi >= 0) { game.bagSlots[fi] = item; placed = true; } }
+    if (!placed && hasBackpack()) { fi = game.packSlots.indexOf(null); if (fi >= 0) { game.packSlots[fi] = item; placed = true; } }
+    if (!placed) { log('🎒 Инвентарь переполнен!'); return false; }
   }
   game.inventory[item] = (game.inventory[item]|0) + n;
   renderInventory(); return true;
@@ -1025,13 +1370,14 @@ function updateWorld(dt, t) {
       e.regrow -= dt;
       if (e.regrow <= 0) { e.berries = 4; setBushBerries(e.obj, 4); }
     }
-    // лёгкое покачивание деревьев + «удар»-подскок
-    if (e.type === 'tree') e.obj.rotation.z = Math.sin(t*1.2 + e.sway) * 0.025;
+    // лёгкое покачивание деревьев/пальм + «удар»-подскок
+    if (e.type === 'tree' || e.type === 'palm') e.obj.rotation.z = Math.sin(t*1.2 + e.sway) * 0.025;
+    const base = e.baseScale || 1;
     if (e.obj.userData.pop > 0) {
       e.obj.userData.pop -= dt * 4;
-      const s = 1 + Math.max(0, e.obj.userData.pop) * 0.12;
+      const s = base * (1 + Math.max(0, e.obj.userData.pop) * 0.12);
       e.obj.scale.setScalar(s);
-    } else if (e.obj.scale.x !== 1) e.obj.scale.setScalar(1);
+    } else if (e.obj.scale.x !== base) e.obj.scale.setScalar(base);
   }
 }
 
@@ -1078,54 +1424,73 @@ function renderClock() {
     String(h).padStart(2,'0') + ':' + String(m).padStart(2,'0');
   document.getElementById('phase-label').textContent = phaseInfo()[0];
 }
+let dragSource = null;
+
+function setupSlotDrag(el, arrName, idx) {
+  const arr = getSlotArray(arrName);
+  const item = arr[idx];
+  if (item && (game.inventory[item]|0) > 0) el.draggable = true;
+  el.addEventListener('dragstart', e => {
+    const it = getSlotArray(arrName)[idx];
+    if (!it || (game.inventory[it]|0) <= 0) { e.preventDefault(); return; }
+    dragSource = { arr: arrName, idx };
+    el.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+  });
+  el.addEventListener('dragend', () => { el.classList.remove('dragging'); dragSource = null; });
+  el.addEventListener('dragover', e => { if (dragSource) { e.preventDefault(); el.classList.add('drag-over'); } });
+  el.addEventListener('dragleave', () => el.classList.remove('drag-over'));
+  el.addEventListener('drop', e => {
+    e.preventDefault(); el.classList.remove('drag-over');
+    if (!dragSource) return;
+    const sArr = getSlotArray(dragSource.arr), dArr = getSlotArray(arrName);
+    const tmp = sArr[dragSource.idx]; sArr[dragSource.idx] = dArr[idx]; dArr[idx] = tmp;
+    dragSource = null;
+    renderInventory();
+  });
+}
+
 function renderInventory() {
+  cleanupSlots();
   const inv = document.getElementById('inventory');
   inv.innerHTML = '';
   game.hotbar.forEach((item, i) => {
     const slot = document.createElement('div');
     slot.className = 'slot' + (i === game.activeSlot ? ' active' : '');
     slot.innerHTML = `<span class="key">${i+1}</span>`;
-    if (item) {
+    if (item && (game.inventory[item]|0) > 0) {
       const c = game.inventory[item] | 0;
       slot.innerHTML += `<span>${ITEMS[item].icon}</span><span class="count">${c}</span>`;
-      slot.style.opacity = c === 0 ? .4 : 1;
     }
+    setupSlotDrag(slot, 'hotbar', i);
     slot.onclick = () => { game.activeSlot = i; useHotbar(i); renderInventory(); };
     inv.appendChild(slot);
   });
-  autoFillHotbar();
   renderBag();
 }
-function autoFillHotbar() {
-  for (const item of Object.keys(game.inventory)) {
-    if (item === 'backpack') continue;
-    if ((game.inventory[item]|0) > 0 && !game.hotbar.includes(item)) {
-      const free = game.hotbar.indexOf(null);
-      if (free >= 0) game.hotbar[free] = item;
-    }
-  }
-}
+
 function renderBag() {
-  const items = Object.keys(game.inventory).filter(k => k !== 'backpack' && (game.inventory[k]|0) > 0);
-  fillGrid(document.getElementById('bag-grid'), items.slice(0, BAG_SLOTS), BAG_SLOTS);
+  fillGrid(document.getElementById('bag-grid'), 'bag', BAG_SLOTS);
   const packWrap = document.getElementById('bag-pack');
   if (hasBackpack()) {
     packWrap.classList.remove('hidden');
-    fillGrid(document.getElementById('pack-grid'), items.slice(BAG_SLOTS, BAG_SLOTS+PACK_SLOTS), PACK_SLOTS);
+    fillGrid(document.getElementById('pack-grid'), 'pack', PACK_SLOTS);
   } else packWrap.classList.add('hidden');
 }
-function fillGrid(el, items, total) {
+function fillGrid(el, arrName, total) {
+  const slots = getSlotArray(arrName);
   el.innerHTML = '';
   for (let i = 0; i < total; i++) {
-    const item = items[i];
+    const item = slots[i];
     const slot = document.createElement('div');
     slot.className = 'slot bag-slot';
-    if (item) {
+    if (item && (game.inventory[item]|0) > 0) {
       const c = game.inventory[item] | 0;
       slot.innerHTML = `<span>${ITEMS[item].icon}</span><span class="count">${c}</span>`;
       slot.title = ITEMS[item].name;
       slot.onclick = () => useItem(item);
     }
+    setupSlotDrag(slot, arrName, i);
     el.appendChild(slot);
   }
 }
@@ -1190,11 +1555,13 @@ function loop(ts) {
   if (game.running) {
     movePlayer(dt);
     updateNear();
+    updateLadderPrompt();
     updateFishing(dt, clock);
     updateTime(dt);
     updateStats(dt);
     updateWorld(dt, clock);
     updateSplash(dt);
+    updatePickups(dt, clock);
     renderClock();
   } else {
     // лёгкое вращение камеры на старте
@@ -1202,6 +1569,7 @@ function loop(ts) {
   }
   updateLighting(clock);
   updateCamera();
+  updateHeld();
   // анимация воды
   if (waterGeo) {
     const pos = waterGeo.attributes.position;
@@ -1222,14 +1590,18 @@ function loop(ts) {
 function startGame() {
   // чистим прошлые сущности
   endFishing();
+  clearPickups();
   for (const e of [...game.entities]) removeEntity(e);
   game.entities = [];
   scatterWorld();
+  if (palmProto) spawnPalms();
   if (game.player) { scene.remove(game.player.obj); }
   initPlayer();
 
   game.inventory = {};
-  game.hotbar = ['campfire', 'berry', null, null, null];
+  game.hotbar = [null, null, null, null, null];
+  game.bagSlots = new Array(BAG_SLOTS).fill(null);
+  game.packSlots = new Array(PACK_SLOTS).fill(null);
   game.activeSlot = 0;
   game.time = 6 * 60; game.day = 1; game.running = true;
   give('wood', 3);
@@ -1271,4 +1643,6 @@ document.getElementById('restart-btn').onclick = startGame;
 requestAnimationFrame(loop);
 
 // debug-хуки (для отладки в превью)
-window.__dbg = { game, camCtl, startGame, THREE, blocked, get camera() { return camera; }, updateNear, doAction, startFishing, terrainHeight };
+window.__dbg = { game, camCtl, startGame, THREE, blocked, get camera() { return camera; }, updateNear, doAction, startFishing, terrainHeight, dropPickup, get pickups() { return pickups; },
+  get heldGroup() { return heldGroup; }, get heldAxe() { return heldAxe; }, AXE_BASE_ROT, AXE_BASE_POS,
+  get deck() { return game.deck; } };
