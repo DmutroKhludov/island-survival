@@ -84,7 +84,7 @@ const game = {
 };
 
 const DAY_MINUTES = 24 * 60;
-const GAME_MIN_PER_SEC = 10;
+const GAME_MIN_PER_SEC = 4.8;      // 5 реальных минут на полные сутки (1440 / 4.8 = 300 с)
 
 /* ====================================================================
    Предметы и рецепты
@@ -474,15 +474,34 @@ function makeCampfire() {
   return g;
 }
 
+// бочка с лутом (деревянная, с обручами)
+function makeBarrel() {
+  const g = new THREE.Group();
+  const wood = toon(0x8a5a32), band = toon(0x55402a), lid = toon(0x6f4524);
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.42, 1.0, 14), wood);
+  body.position.y = 0.5; body.castShadow = true; g.add(body);
+  // лёгкая «пузатость»
+  const belly = new THREE.Mesh(new THREE.CylinderGeometry(0.47, 0.47, 0.5, 14), wood);
+  belly.position.y = 0.5; belly.castShadow = true; g.add(belly);
+  for (const y of [0.16, 0.5, 0.84]) {                 // обручи
+    const b = new THREE.Mesh(new THREE.CylinderGeometry(0.49, 0.49, 0.07, 14), band);
+    b.position.y = y; g.add(b);
+  }
+  const top = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.4, 0.06, 14), lid);
+  top.position.y = 1.02; top.castShadow = true; g.add(top);
+  return g;
+}
+
 /* ---- Сущности ---- */
 function addEntity(type, x, z, opts = {}) {
-  const gh = terrainHeight(x, z);
+  const gh = opts.y !== undefined ? opts.y : terrainHeight(x, z);   // y можно задать (бочка на палубе)
   let obj, e;
   if (type === 'tree')      { obj = makeTree(); e = { r: 1.0, hp: 3, solid: true, sway: rand(0,6.28) }; }
   else if (type === 'rock') { obj = makeRock(); e = { r: 0.9, hp: 3, solid: true }; }
   else if (type === 'bush') { const b = opts.berries ?? 4; obj = makeBush(b); e = { r: 0.8, hp: 2, solid: false, berries: b, regrow: 0 }; }
   else if (type === 'grass'){ obj = makeGrassTuft(); e = { r: 0.4, hp: 1, solid: false }; }
   else if (type === 'campfire') { obj = makeCampfire(); e = { r: 0.9, solid: false, fuel: 60, lit: true, sway: rand(0,6.28) }; }
+  else if (type === 'barrel') { obj = makeBarrel(); e = { r: 0.5, solid: false, loot: opts.loot || {} }; }
   obj.position.set(x, gh, z);
   obj.rotation.y = opts.rot !== undefined ? opts.rot : rand(0, Math.PI * 2);
   scene.add(obj);
@@ -570,7 +589,27 @@ function makePlayerModel() {
   const hair = new THREE.Mesh(new THREE.SphereGeometry(0.36, 12, 12, 0, Math.PI*2, 0, Math.PI*0.55), toon(0x6b452a));
   hair.position.y = 1.9;
   g.add(hair);
-  g.userData = { legL, legR, armL, armR, body };
+  // язычки пламени — видны другим, когда игрок горит (по умолчанию скрыты)
+  const flames = new THREE.Group();
+  const N = 8;
+  for (let i = 0; i < N; i++) {
+    const a = (i / N) * Math.PI * 2 + rand(-0.3, 0.3);
+    const rad = rand(0.34, 0.5);                       // по кольцу вокруг тела
+    const h = rand(0.7, 1.15);
+    const f = new THREE.Mesh(
+      new THREE.ConeGeometry(rand(0.15, 0.22), h, 6),
+      new THREE.MeshBasicMaterial({ color: i % 2 ? 0xffd24a : 0xff6a1e })
+    );
+    f.position.set(Math.cos(a) * rad, rand(0.5, 1.9), Math.sin(a) * rad);
+    flames.add(f);
+  }
+  // крупный язык над головой
+  const crown = new THREE.Mesh(new THREE.ConeGeometry(0.3, 1.0, 7), new THREE.MeshBasicMaterial({ color: 0xff8a22 }));
+  crown.position.y = 2.35;
+  flames.add(crown);
+  flames.visible = false;
+  g.add(flames);
+  g.userData = { legL, legR, armL, armR, body, flames };
   return g;
 }
 
@@ -672,7 +711,7 @@ function initPlayer() {
     y: terrainHeight(sp.x, sp.z), vy: 0, mode: 'ground', ladder: null,
     speed: 7.5, moving: false,
     hp: 100, food: 100, energy: 100, warm: 100,
-    swing: 0, step: 0,
+    swing: 0, step: 0, burnTimer: 0,
   };
   obj.position.set(sp.x, terrainHeight(sp.x, sp.z), sp.z);
 }
@@ -696,7 +735,7 @@ function setupControls() {
   // ЛКМ — действие по прицелу + (пере)захват курсора
   el.addEventListener('mousedown', e => {
     if (e.button !== 0 || !game.running) return;
-    if (menuOpen()) return;
+    if (menuOpen() || game.chatting) return;
     if (!camCtl.locked) { lockPointer(); return; }   // первый клик после Esc — только вернуть захват
     doAction();
   });
@@ -710,7 +749,7 @@ function setupControls() {
   // свободный обзор: камера крутится от ДВИЖЕНИЯ мыши над игрой, без кнопок.
   // При захвате курсора события приходят на сам canvas — тот же обработчик.
   el.addEventListener('mousemove', e => {
-    if (!game.running || menuOpen()) return;   // при открытом инвентаре/крафте камеру не двигаем
+    if (!game.running || menuOpen() || game.chatting) return;   // меню/чат — камеру не двигаем
     const k = camCtl.locked ? 0.0024 : 0.004;
     const mx = clamp(e.movementX || 0, -90, 90);     // отсечь рывки при возврате курсора
     const my = clamp(e.movementY || 0, -90, 90);
@@ -746,7 +785,9 @@ function codeToKey(e) {
   return e.key.toLowerCase();
 }
 window.addEventListener('keydown', e => {
+  if (game.chatting) return;                 // во время набора в чат игра не реагирует
   const k = codeToKey(e);
+  if (k === 't' && game.running) { e.preventDefault(); openChat(); return; }   // T — открыть чат
   if (['arrowup','arrowdown','arrowleft','arrowright',' '].includes(k)) e.preventDefault();
   if (!keys[k]) onKeyPress(k);
   keys[k] = true;
@@ -755,6 +796,7 @@ window.addEventListener('keyup', e => { keys[codeToKey(e)] = false; });
 
 function onKeyPress(k) {
   if (!game.running) return;
+  if (game.lootBarrel) { if (k === 'e' || k === 'i') closeBarrel(); return; }  // бочка открыта — E закрывает
   if (k === 'c') toggleCraft();
   if (k === 'e' || k === 'i') toggleBag();
   if (k >= '1' && k <= '9') {
@@ -849,6 +891,47 @@ function setupDeck(ship) {
     lad.rotation.y = ry + Math.PI / 2;   // плоскостью к борту (перекладины горизонтально)
     scene.add(lad);
     L.mesh = lad;
+  }
+  spawnBarrels();                        // лутбочка на палубе
+}
+
+// детерминированный лут бочки (одинаковый у всех игроков)
+function rollBarrelLoot(idx) {
+  seedRng(SEED + 50 + idx);
+  const pool = [
+    ['wood', 4, 10], ['stone', 3, 8], ['fiber', 4, 9],
+    ['coconut', 2, 4], ['berry', 3, 7], ['fish', 1, 3],
+  ];
+  // 4–6 разных видов ресурса (побольше лута)
+  const n = 4 + (srand() * 3 | 0);
+  const loot = {};
+  for (let k = 0; k < n; k++) {
+    const [item, lo, hi] = pool[(srand() * pool.length) | 0];
+    loot[item] = (loot[item] || 0) + (lo + (srand() * (hi - lo + 1) | 0));
+  }
+  // редкий шанс на инструмент/рюкзак — по 15% на каждый (порядок фиксирован для детерминизма)
+  for (const tool of ['axe', 'rod', 'backpack']) {
+    if (srand() < 0.15) loot[tool] = 1;
+  }
+  return loot;
+}
+
+// поставить лутбочку(и) на палубу (детерминированно, с учётом уже забранного/опустошённого)
+function spawnBarrels() {
+  const D = game.deck;
+  if (!D) return;
+  const cos = Math.cos(D.ry), sin = Math.sin(D.ry);
+  const c2w = (lx, lz) => ({ x: D.cx + lx * cos - lz * sin, z: D.cz + lx * sin + lz * cos });
+  const cfgs = [{ id: 200000, lx: -1.0, lz: 1.4, idx: 0 }];   // одна бочка (можно добавить ещё)
+  for (const cfg of cfgs) {
+    if (game.entities.some(e => e.id === cfg.id)) continue;   // уже стоит
+    if (net.harvested.has(cfg.id)) continue;                  // уже опустошена
+    const loot = rollBarrelLoot(cfg.idx);
+    const taken = net.looted[cfg.id] || {};
+    for (const it in taken) { loot[it] = (loot[it] || 0) - taken[it]; if (loot[it] <= 0) delete loot[it]; }
+    if (Object.keys(loot).length === 0) continue;             // лут уже разобрали
+    const w = c2w(cfg.lx, cfg.lz);
+    addEntity('barrel', w.x, w.z, { id: cfg.id, y: D.deckY, rot: D.ry, loot });
   }
 }
 
@@ -988,8 +1071,8 @@ function updateLadderPrompt() {
 
 function updateNear() {
   const p = game.player;
-  // во время лазания / на палубе обычные взаимодействия не нужны
-  if (p.mode === 'climb' || p.mode === 'deck') {
+  // во время лазания взаимодействия не нужны (на палубе оставляем — там бочка)
+  if (p.mode === 'climb') {
     game.near = null;
     if (!game.fishing) hidePrompt();
     return;
@@ -1023,9 +1106,9 @@ function updateNear() {
     }
   }
 
-  // рыбалка: прицел смотрит на воду перед собой (если ещё не рыбачим)
+  // рыбалка: прицел смотрит на воду перед собой (если ещё не рыбачим; не с палубы)
   const fx = p.x + Math.sin(p.dir) * 2.4, fz = p.z + Math.cos(p.dir) * 2.4;
-  if (!game.fishing && isWater(fx, fz) && (game.inventory.rod | 0) > 0) {
+  if (p.mode !== 'deck' && !game.fishing && isWater(fx, fz) && (game.inventory.rod | 0) > 0) {
     game.near = 'water'; showPrompt('🎣 ЛКМ — рыбачить'); return;
   }
   game.near = null;
@@ -1043,6 +1126,7 @@ function promptFor(e) {
     case 'campfire':
       return (game.inventory.fish|0) > 0 ? '🍤 ЛКМ — пожарить рыбу' : '🔥 ЛКМ — подкинуть дров';
     case 'fishbite': return '🐟 ЛКМ — подсечь!';
+    case 'barrel': return '📦 ЛКМ — открыть бочку';
   }
   return '';
 }
@@ -1051,6 +1135,7 @@ function doAction() {
   const p = game.player;
   // подсечь прыгающую рыбу — мгновенно, без затрат сил
   if (game.near && game.near.type === 'fishbite') { catchFish(game.near); return; }
+  if (game.near && game.near.type === 'barrel') { openBarrel(game.near); return; }   // открыть бочку
   if (p.energy < 4) { log('Слишком устал…'); return; }
   if (game.near === 'water') { startFishing(); return; }
   if (!game.near) { log('Тут нечего делать.'); return; }
@@ -1430,6 +1515,12 @@ function placeItem(item) {
    Время / статы / мир
 ==================================================================== */
 function updateTime(dt) {
+  if (net.timeSynced) {                          // время от сервера — одинаково у всех
+    const w = computeWorldTime();
+    game.time = w.time;
+    if (w.day !== game.day) { game.day = w.day; log(`☀️ Наступил день ${game.day}`); }
+    return;
+  }
   game.time += dt * GAME_MIN_PER_SEC;
   if (game.time >= DAY_MINUTES) { game.time -= DAY_MINUTES; game.day++; log(`☀️ Наступил день ${game.day}`); }
 }
@@ -1463,17 +1554,31 @@ function updateStats(dt) {
   if (fire) {
     p.warm = clamp(p.warm + 4, 0, 100);
     if (!p.moving) p.energy = clamp(p.energy + 1.2, 0, 100);
-  } else if (isNight) p.warm = clamp(p.warm - 2.2, 0, 100);
+  } else if (isNight) p.warm = clamp(p.warm - 3.0, 0, 100);   // ночью без костра быстро мёрзнешь
   else p.warm = clamp(p.warm + 1.5, 0, 100);
+
+  // предупреждения о холоде
+  if (p.warm <= 0) {
+    if (!p.freezing) { p.freezing = true; log('🥶 Ты замерзаешь! Скорее к костру!'); }
+  } else if (p.freezing && p.warm > 25) { p.freezing = false; log('🔥 Согрелся'); }
+  else if (p.warm > 0 && p.warm <= 20 && !p.freezing && isNight && !fire) log('❄️ Холодно… нужен костёр');
 
   let dmg = 0;
   if (p.food <= 0) dmg += 1.2;
-  if (p.warm <= 0) dmg += 1.5;
+  if (p.warm <= 0) dmg += 2.5;            // замерзание — серьёзный урон
   if (dmg > 0) p.hp = clamp(p.hp - dmg, 0, 100);
   else if (p.food > 40 && p.warm > 30) p.hp = clamp(p.hp + 0.4, 0, 100);
 
   if (p.hp <= 0) endGame(false);
   renderStats();
+}
+// иней на экране нарастает по мере падения тепла (полный «мороз» при 0)
+function updateColdOverlay() {
+  const p = game.player, el = document.getElementById('cold');
+  if (!el || !p) return;
+  const f = clamp((35 - p.warm) / 35, 0, 1);      // тепло 35..0 → иней 0..1
+  el.style.opacity = (f * 0.92).toFixed(2);
+  el.classList.toggle('freezing', p.warm <= 0);   // пульс при полном замерзании
 }
 function nearestLitFire(x, z, range) {
   let best = null, bd = range*range;
@@ -1484,6 +1589,37 @@ function nearestLitFire(x, z, range) {
     }
   }
   return best;
+}
+
+/* ---- Горение: стоишь в огне → урон + пламя (видно другим) ---- */
+const BURN_DPS = 16;            // урона в секунду, пока горишь
+const BURN_RADIUS = 0.85;      // радиус «внутри костра»
+const BURN_LINGER = 1.2;       // сколько ещё горишь после выхода из огня (сек)
+function inLitFire(x, z) {
+  for (const e of game.entities)
+    if (e.type === 'campfire' && e.lit && dist2(x, z, e.x, e.z) < BURN_RADIUS * BURN_RADIUS) return true;
+  return false;
+}
+function updateBurning(dt) {
+  const p = game.player;
+  if (!p || !game.running) return;
+  const wasBurning = p.burnTimer > 0;
+  if (inLitFire(p.x, p.z)) {
+    if (!wasBurning) log('🔥 Ты загорелся! Скорее в сторону!');
+    p.burnTimer = BURN_LINGER;                 // поджигаемся / поддерживаем горение
+  }
+  if (p.burnTimer > 0) {
+    p.burnTimer -= dt;
+    p.hp = clamp(p.hp - BURN_DPS * dt, 0, 100);
+    renderStats();
+    if (p.hp <= 0) { p.burnTimer = 0; setBurnOverlay(false); endGame(false); return; }
+  }
+  // оверлей всегда соответствует текущему состоянию (гаснет, как только перестаёшь гореть)
+  setBurnOverlay(p.burnTimer > 0);
+}
+function setBurnOverlay(on) {
+  const el = document.getElementById('burn');
+  if (el) el.classList.toggle('show', on);
 }
 
 function updateWorld(dt, t) {
@@ -1517,12 +1653,13 @@ function updateWorld(dt, t) {
   }
 }
 
-/* ---- освещение по времени суток (тёплое) ---- */
+/* ---- освещение по времени суток (тёплое днём, тёмное ночью) ---- */
 const colDay = new THREE.Color(0xffe2b0);
-const colNight = new THREE.Color(0x2a3a55);
+const colNight = new THREE.Color(0x0a1020);   // тёмная ночь (но силуэты различимы)
 const colDusk = new THREE.Color(0xff9d5c);
 const sunDay = new THREE.Color(0xffd9a0);
 const sunDusk = new THREE.Color(0xff7e3a);
+const colMoon = new THREE.Color(0x6f86c4);     // холодный лунный свет
 function updateLighting(t) {
   const L = daylight();                       // 0 ночь … 1 день
   // цвет неба/тумана: ночь→день, с закатным оттенком на стыке
@@ -1531,16 +1668,21 @@ function updateLighting(t) {
   sky.lerp(colDusk, duskAmount * 0.5);
   scene.background.copy(sky);
   scene.fog.color.copy(sky);
+  // ночью туман подступает ближе — темнота обволакивает
+  scene.fog.near = lerp(28, 60, L);
+  scene.fog.far  = lerp(105, 165, L);
 
-  sun.intensity = 0.15 + L * 1.05;
+  sun.intensity = 0.03 + L * 1.12;            // ночью почти нет солнца
   sun.color.copy(sunDay).lerp(sunDusk, duskAmount);
+  // ночью свет «луны» — холодный и слабый
+  if (L < 0.25) sun.color.lerp(colMoon, (0.25 - L) * 4);
   // солнце движется по дуге
   const ang = (game.time / DAY_MINUTES) * Math.PI * 2 - Math.PI/2;
   sun.position.set(Math.cos(ang) * 60, Math.max(8, Math.sin(ang) * 70 + 10), 25);
   sun.target.position.set(game.player.x, 0, game.player.z);
 
-  hemi.intensity = 0.25 + L * 0.5;
-  ambient.intensity = 0.18 + L * 0.12;
+  hemi.intensity = 0.085 + L * 0.6;           // ночью темно, но не слепо
+  ambient.intensity = 0.06 + L * 0.16;
 }
 
 /* ====================================================================
@@ -1601,6 +1743,7 @@ function setupSlotDrag(el, arrName, idx) {
     e.preventDefault(); el.classList.remove('drag-over');
     if (!dragSource) return;
     dragHandled = true;          // легло в слот — наружу не выбрасываем
+    if (dragSource.from === 'loot') { takeFromBarrel(dragSource.item); dragSource = null; return; }
     const sArr = getSlotArray(dragSource.arr), dArr = getSlotArray(arrName);
     const tmp = sArr[dragSource.idx]; sArr[dragSource.idx] = dArr[idx]; dArr[idx] = tmp;
     dragSource = null;
@@ -1652,6 +1795,60 @@ function fillGrid(el, arrName, total) {
     el.appendChild(slot);
   }
 }
+
+/* ---- Лутбочка (контейнер в стиле Rust) ---- */
+function openBarrel(e) {
+  game.lootBarrel = e;
+  document.getElementById('loot').classList.remove('hidden');
+  document.getElementById('bag').classList.remove('hidden');
+  renderLoot(); renderBag();
+  document.exitPointerLock();
+  updateCursor();
+}
+function closeBarrel() {
+  game.lootBarrel = null;
+  document.getElementById('loot').classList.add('hidden');
+  document.getElementById('bag').classList.add('hidden');
+  updateCursor();
+  if (game.running) lockPointer();
+}
+function renderLoot() {
+  const e = game.lootBarrel;
+  const grid = document.getElementById('loot-grid');
+  grid.innerHTML = '';
+  if (!e || !e.loot) return;
+  const items = Object.keys(e.loot).filter(it => (e.loot[it] | 0) > 0);
+  for (const item of items) {
+    const slot = document.createElement('div');
+    slot.className = 'slot bag-slot loot-slot';
+    slot.innerHTML = `<span>${ITEMS[item].icon}</span><span class="count">${e.loot[item]|0}</span>`;
+    slot.title = `${ITEMS[item].name} — забрать`;
+    slot.draggable = true;
+    slot.onclick = () => takeFromBarrel(item);
+    slot.addEventListener('dragstart', ev => { dragSource = { from: 'loot', item }; dragHandled = false; ev.dataTransfer.effectAllowed = 'move'; });
+    slot.addEventListener('dragend', () => { dragSource = null; });
+    grid.appendChild(slot);
+  }
+}
+// забрать стак из бочки в инвентарь
+function takeFromBarrel(item) {
+  const e = game.lootBarrel;
+  if (!e || !e.loot || (e.loot[item] | 0) <= 0) return;
+  if (!canTake(item)) { log('🎒 Некуда положить — инвентарь полон'); return; }
+  const count = e.loot[item] | 0;
+  give(item, count);
+  delete e.loot[item];
+  netLoot(e.id, item, count);
+  log(`📦 Взял ${ITEMS[item].icon} ${ITEMS[item].name} ×${count}`);
+  renderLoot(); renderInventory();
+  if (Object.keys(e.loot).filter(it => (e.loot[it] | 0) > 0).length === 0) emptyBarrel(e);
+}
+function emptyBarrel(e) {
+  harvestRemove(e);              // бочка опустела — убрать у всех (и для опоздавших)
+  closeBarrel();
+  log('📦 Бочка опустела');
+}
+
 function renderCraft() {
   const list = document.getElementById('craft-list');
   list.innerHTML = '';
@@ -1687,10 +1884,11 @@ function toggleBag() {
   updateCursor();
 }
 
-// открыто ли какое-либо окно (крафт/инвентарь)
+// открыто ли какое-либо окно (крафт/инвентарь/бочка)
 function menuOpen() {
   return !document.getElementById('craft').classList.contains('hidden')
-      || !document.getElementById('bag').classList.contains('hidden');
+      || !document.getElementById('bag').classList.contains('hidden')
+      || !document.getElementById('loot').classList.contains('hidden');
 }
 
 // курсор скрыт во время игры (свободный обзор) и виден, когда открыто меню
@@ -1704,6 +1902,39 @@ function log(text) {
   const m = document.createElement('div'); m.className = 'msg'; m.textContent = text;
   el.appendChild(m); setTimeout(() => m.remove(), 4500);
   while (el.children.length > 5) el.removeChild(el.firstChild);
+}
+
+/* ---- Чат ---- */
+function addChatLine(name, text) {
+  const el = document.getElementById('chat-log');
+  const m = document.createElement('div');
+  m.className = 'chat-msg';
+  m.innerHTML = `<b>${escapeHtml(name || 'Гость')}:</b> ${escapeHtml(text)}`;
+  el.appendChild(m);
+  setTimeout(() => m.remove(), 14000);
+  while (el.children.length > 8) el.removeChild(el.firstChild);
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function openChat() {
+  if (!game.running || game.chatting) return;
+  game.chatting = true;
+  for (const k in keys) keys[k] = false;          // отпустить клавиши движения
+  const inp = document.getElementById('chat-input');
+  inp.value = '';
+  inp.classList.add('show');
+  document.exitPointerLock();
+  inp.focus();
+}
+function closeChat(send) {
+  const inp = document.getElementById('chat-input');
+  const text = inp.value.trim();
+  inp.classList.remove('show');
+  inp.blur();
+  game.chatting = false;
+  if (send && text) { addChatLine(game.playerName, text); netChat(text); }
+  if (game.running) lockPointer();
 }
 
 /* ====================================================================
@@ -1724,6 +1955,8 @@ function loop(ts) {
     updateWorld(dt, clock);
     updateSplash(dt);
     updatePickups(dt, clock);
+    updateBurning(dt);
+    updateColdOverlay();
     netSendMove();
     renderClock();
   } else {
@@ -1731,6 +1964,7 @@ function loop(ts) {
     camCtl.yaw += dt * 0.08;
   }
   updateRemotes(dt);
+  updateNameTags();
   updateLighting(clock);
   updateCamera();
   updateHeld();
@@ -1761,6 +1995,7 @@ function startGame() {
   scatterWorld();
   if (palmProto) spawnPalms();
   applyPlaced();                       // вернуть поставленные костры (свои и чужие)
+  spawnBarrels();                      // вернуть лутбочку на палубу
   if (game.player) { scene.remove(game.player.obj); }
   initPlayer();
 
@@ -1769,16 +2004,26 @@ function startGame() {
   game.bagSlots = new Array(BAG_SLOTS).fill(null);
   game.packSlots = new Array(PACK_SLOTS).fill(null);
   game.activeSlot = 0;
-  game.time = 6 * 60; game.day = 1; game.running = true;
+  if (net.timeSynced) { const w = computeWorldTime(); game.time = w.time; game.day = w.day; }
+  else { game.time = 6 * 60; game.day = 1; }
+  game.running = true;
   give('wood', 3);
   renderStats(); renderInventory(); renderClock();
   document.getElementById('overlay').classList.add('hidden');
   document.getElementById('gameover').classList.add('hidden');
+  hideCold();
+  setBurnOverlay(false);
   updateCursor();
   log('🏝️ Ты на острове. Осмотрись.');
 }
+function hideCold() {
+  const el = document.getElementById('cold');
+  if (el) { el.style.opacity = 0; el.classList.remove('freezing'); }
+}
 function endGame(won) {
   game.running = false;
+  hideCold();
+  setBurnOverlay(false);
   updateCursor();
   const go = document.getElementById('gameover');
   document.getElementById('go-title').textContent = won ? '🌟 Спасён!' : '💀 Конец пути';
@@ -1797,7 +2042,15 @@ function dayWord(n) {
 /* ====================================================================
    Мультиплеер (сеть)
 ==================================================================== */
-const net = { ws: null, id: null, connected: false, others: new Map(), harvested: new Set(), placed: new Map() };
+const net = { ws: null, id: null, connected: false, others: new Map(), harvested: new Set(), placed: new Map(), looted: {},
+  timeSynced: false, clockOffset: 0, worldStart: 0, startMin: 0 };
+
+// мировое время из «эпохи» сервера (одинаково у всех игроков, без дрейфа)
+function computeWorldTime() {
+  const totalMin = net.startMin + (Date.now() + net.clockOffset - net.worldStart) / 1000 * GAME_MIN_PER_SEC;
+  const time = ((totalMin % DAY_MINUTES) + DAY_MINUTES) % DAY_MINUTES;
+  return { time, day: 1 + Math.floor(totalMin / DAY_MINUTES) };
+}
 let worldBuilt = false;
 
 // найти/убрать объект по сетевому id
@@ -1869,6 +2122,23 @@ function netFuel(id, fuel) {
   if (!net.connected || !net.ws || net.ws.readyState !== 1) return;
   net.ws.send(JSON.stringify({ type: 'fuel', id, fuel }));
 }
+// забрали предмет из бочки — учесть и разослать
+function netLoot(id, item, count) {
+  const b = net.looted[id] || (net.looted[id] = {});
+  b[item] = (b[item] || 0) + count;
+  if (!net.connected || !net.ws || net.ws.readyState !== 1) return;
+  net.ws.send(JSON.stringify({ type: 'loot', id, item, count }));
+}
+// отправить своё имя серверу (после установки/подключения)
+function netName() {
+  if (!game.playerName || !net.connected || !net.ws || net.ws.readyState !== 1) return;
+  net.ws.send(JSON.stringify({ type: 'name', name: game.playerName }));
+}
+// отправить сообщение чата
+function netChat(text) {
+  if (!net.connected || !net.ws || net.ws.readyState !== 1) return;
+  net.ws.send(JSON.stringify({ type: 'chat', text }));
+}
 
 // мир строится один раз — либо после получения seed от сервера (общий остров),
 // либо офлайн со случайным seed, если сервера нет
@@ -1894,15 +2164,38 @@ function addRemote(p) {
   const obj = makePlayerModel();
   obj.visible = true;
   scene.add(obj);
+  // ярлык с ником над головой
+  const label = document.createElement('div');
+  label.className = 'nametag';
+  label.textContent = p.name || '';
+  label.style.display = p.name ? 'block' : 'none';
+  document.getElementById('nametags').appendChild(label);
   net.others.set(p.id, {
     obj, x: p.x, z: p.z, y: p.y, dir: p.dir || 0,
     tx: p.x, tz: p.z, ty: p.y, tdir: p.dir || 0,
-    moving: !!p.moving, step: 0,
+    moving: !!p.moving, step: 0, burning: !!p.burning,
+    name: p.name || '', label,
   });
 }
 function removeRemote(id) {
   const r = net.others.get(id);
-  if (r) { scene.remove(r.obj); net.others.delete(id); }
+  if (r) { scene.remove(r.obj); if (r.label) r.label.remove(); net.others.delete(id); }
+}
+// проецируем 3D-позицию головы каждого игрока на экран → позиционируем ник
+const _tagVec = new THREE.Vector3();
+function updateNameTags() {
+  for (const r of net.others.values()) {
+    if (!r.label) continue;
+    if (!r.name) { r.label.style.display = 'none'; continue; }
+    _tagVec.set(r.x, r.y + 2.3, r.z);
+    _tagVec.project(camera);
+    if (_tagVec.z > 1) { r.label.style.display = 'none'; continue; }  // за камерой
+    const sx = (_tagVec.x * 0.5 + 0.5) * VW;
+    const sy = (-_tagVec.y * 0.5 + 0.5) * VH;
+    r.label.style.display = 'block';
+    r.label.style.left = sx + 'px';
+    r.label.style.top = sy + 'px';
+  }
 }
 
 function updateRemotes(dt) {
@@ -1921,6 +2214,14 @@ function updateRemotes(dt) {
       u.legL.rotation.x = sw; u.legR.rotation.x = -sw;
       u.armL.rotation.x = -sw; u.armR.rotation.x = sw;
     }
+    // пламя горящего игрока (видно у других)
+    if (u && u.flames) {
+      u.flames.visible = !!r.burning;
+      if (r.burning) {
+        u.flames.rotation.y += dt * 4;
+        u.flames.scale.setScalar(0.8 + Math.sin(performance.now() * 0.018 + r.step) * 0.25);
+      }
+    }
   }
 }
 
@@ -1932,7 +2233,7 @@ function netSendMove() {
   lastSent = now;
   const p = game.player;
   net.ws.send(JSON.stringify({
-    type: 'move', x: p.x, z: p.z, y: p.y, dir: p.dir, moving: !!p.moving,
+    type: 'move', x: p.x, z: p.z, y: p.y, dir: p.dir, moving: !!p.moving, burning: p.burnTimer > 0,
   }));
 }
 
@@ -1963,31 +2264,58 @@ function connectMultiplayer() {
       for (const m of (msg.drops || [])) spawnRemoteDrop(m);   // лежащие мешки
       net.placed = new Map((msg.placed || []).map(m => [m.id, m]));
       applyPlaced();                                           // поставленные костры
+      net.looted = msg.looted || {};
+      spawnBarrels();                                          // лутбочки с учётом забранного
+      netName();                                               // сообщить своё имя (если уже выбрано)
+      if (msg.worldStart) {                                    // синхронизация времени суток
+        net.worldStart = msg.worldStart;
+        net.startMin = msg.startMin || 0;
+        net.clockOffset = (msg.serverNow || Date.now()) - Date.now();   // поправка на расхождение часов ПК
+        net.timeSynced = true;
+        const w = computeWorldTime();
+        game.time = w.time; game.day = w.day;
+      }
       log(`🌐 Онлайн · игроков: ${msg.players.length + 1}`);
     } else if (msg.type === 'join') {
       addRemote({ id: msg.id, x: 0, z: 0, y: 0, dir: 0, moving: false });
       log('🙋 К острову причалил игрок');
     } else if (msg.type === 'move') {
       const r = net.others.get(msg.id);
-      if (r) { r.tx = msg.x; r.tz = msg.z; r.ty = msg.y; r.tdir = msg.dir; r.moving = msg.moving; }
+      if (r) { r.tx = msg.x; r.tz = msg.z; r.ty = msg.y; r.tdir = msg.dir; r.moving = msg.moving; r.burning = !!msg.burning; }
     } else if (msg.type === 'harvest') {
       if (msg.action === 'berry') {
         const e = game.entities.find(e => e.id === msg.id);
         if (e && e.type === 'bush') { e.berries = 0; setBushBerries(e.obj, 0); e.regrow = 70; }
       } else {
         net.harvested.add(msg.id);
+        if (game.lootBarrel && game.lootBarrel.id === msg.id) closeBarrel();
         removeById(msg.id);
       }
     } else if (msg.type === 'drop') {
       spawnRemoteDrop(msg);                 // другой игрок выбросил мешок
     } else if (msg.type === 'pickup') {
       removePickupByPid(msg.pid);           // мешок подобрали — убрать у себя
+    } else if (msg.type === 'name') {
+      const r = net.others.get(msg.id);
+      if (r) { r.name = msg.name || ''; if (r.label) r.label.textContent = r.name; }
+    } else if (msg.type === 'chat') {
+      addChatLine(msg.name, msg.text);
     } else if (msg.type === 'place') {
       spawnRemotePlace(msg);                // другой игрок поставил костёр
     } else if (msg.type === 'fuel') {
       const m = net.placed.get(msg.id); if (m) { m.fuel = msg.fuel; m.lit = true; }
       const e = game.entities.find(e => e.id === msg.id && e.type === 'campfire');
       if (e) { e.fuel = msg.fuel; e.lit = true; }   // костёр друга разгорелся/продлился
+    } else if (msg.type === 'loot') {
+      // другой игрок забрал предмет из бочки
+      const b = net.looted[msg.id] || (net.looted[msg.id] = {});
+      b[msg.item] = (b[msg.item] || 0) + msg.count;
+      const e = game.entities.find(e => e.id === msg.id && e.type === 'barrel');
+      if (e && e.loot) {
+        e.loot[msg.item] = (e.loot[msg.item] || 0) - msg.count;
+        if (e.loot[msg.item] <= 0) delete e.loot[msg.item];
+        if (game.lootBarrel === e) renderLoot();   // обновить открытую бочку
+      }
     } else if (msg.type === 'leave') {
       removeRemote(msg.id);
       log('👋 Игрок уплыл');
@@ -2006,6 +2334,10 @@ connectMultiplayer();   // строит мир после seed от сервер
 
 // по клику «играть» — полноэкранный режим + захват указателя (требуют жеста пользователя)
 function startWithFullscreen() {
+  const nameInp = document.getElementById('name-input');
+  const nm = (nameInp && nameInp.value.trim().slice(0, 16)) || ('Робинзон-' + (Math.random() * 900 + 100 | 0));
+  game.playerName = nm;
+  netName();                           // сообщить серверу имя (друг увидит над головой)
   try { (document.getElementById('game-wrap').requestFullscreen || (()=>{})).call(document.getElementById('game-wrap')); } catch (_) {}
   startGame();
   lockPointer();                       // сразу захватываем мышь → бесконечный обзор
@@ -2014,10 +2346,21 @@ function startWithFullscreen() {
 document.addEventListener('fullscreenchange', () => { setTimeout(resize, 60); if (game.running) setTimeout(lockPointer, 80); });
 document.getElementById('start-btn').onclick = startWithFullscreen;
 document.getElementById('restart-btn').onclick = startWithFullscreen;
+
+// ввод чата: Enter — отправить, Esc — отменить
+const _chatInput = document.getElementById('chat-input');
+if (_chatInput) {
+  _chatInput.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); closeChat(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); closeChat(false); }
+  });
+}
 requestAnimationFrame(loop);
 
 // debug-хуки (для отладки в превью)
 window.__dbg = { game, camCtl, startGame, THREE, blocked, get camera() { return camera; }, updateNear, doAction, startFishing, terrainHeight, dropPickup, get pickups() { return pickups; },
   get heldGroup() { return heldGroup; }, get heldAxe() { return heldAxe; }, AXE_BASE_ROT, AXE_BASE_POS,
   get deck() { return game.deck; }, get net() { return net; },
-  give, dropItemToWorld, getSlotArray, placeItem, get entities() { return game.entities; } };
+  give, dropItemToWorld, getSlotArray, placeItem, get entities() { return game.entities; },
+  rollBarrelLoot };

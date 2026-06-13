@@ -6,10 +6,13 @@ const { WebSocketServer } = require('ws');
 
 const PORT = 3001;
 const SEED = Math.random() * 1000;
+const WORLD_START_MIN = 6 * 60;        // мир «просыпается» в 06:00
+const worldStart = Date.now();         // эпоха мирового времени (старт сервера)
 const players = new Map();
 const harvested = [];          // id уничтоженных объектов (для опоздавших игроков)
 const drops = new Map();       // pid -> { pid, item, count, x, z } — выброшенные мешки
 const placed = [];             // поставленные объекты (костры): { objType, x, z, id, rot }
+const looted = {};             // barrelId -> { item: забрано_всего } (лут из бочек)
 let nextId = 1;
 
 const MIME = {
@@ -32,7 +35,12 @@ const server = http.createServer((req, res) => {
   }
   fs.readFile(filePath, (err, data) => {
     if (err) { res.writeHead(404); res.end('Not found'); return; }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream' });
+    res.writeHead(200, {
+      'Content-Type': MIME[path.extname(filePath)] || 'application/octet-stream',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',  // всегда свежий код у игроков
+      'Pragma': 'no-cache',
+      'Expires': '0',
+    });
     res.end(data);
   });
 });
@@ -41,13 +49,14 @@ const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
   const id = nextId++;
-  players.set(id, { ws, x: 0, z: 0, y: 0, dir: 0, moving: false });
+  players.set(id, { ws, x: 0, z: 0, y: 0, dir: 0, moving: false, burning: false, name: '' });
 
   const existing = [];
   for (const [pid, p] of players) {
-    if (pid !== id) existing.push({ id: pid, x: p.x, z: p.z, y: p.y, dir: p.dir, moving: p.moving });
+    if (pid !== id) existing.push({ id: pid, x: p.x, z: p.z, y: p.y, dir: p.dir, moving: p.moving, burning: p.burning, name: p.name });
   }
-  ws.send(JSON.stringify({ type: 'init', id, seed: SEED, players: existing, harvested, drops: [...drops.values()], placed }));
+  ws.send(JSON.stringify({ type: 'init', id, seed: SEED, players: existing, harvested, drops: [...drops.values()], placed, looted,
+    worldStart, serverNow: Date.now(), startMin: WORLD_START_MIN }));
   broadcast({ type: 'join', id }, id);
 
   ws.on('message', (raw) => {
@@ -57,8 +66,8 @@ wss.on('connection', (ws) => {
         const p = players.get(id);
         if (!p) return;
         p.x = msg.x; p.z = msg.z; p.y = msg.y;
-        p.dir = msg.dir; p.moving = msg.moving;
-        broadcast({ type: 'move', id, x: msg.x, z: msg.z, y: msg.y, dir: msg.dir, moving: msg.moving }, id);
+        p.dir = msg.dir; p.moving = msg.moving; p.burning = !!msg.burning;
+        broadcast({ type: 'move', id, x: msg.x, z: msg.z, y: msg.y, dir: msg.dir, moving: msg.moving, burning: !!msg.burning }, id);
       } else if (msg.type === 'harvest') {
         // сломанный/собранный объект; 'remove' — навсегда (запоминаем для опоздавших)
         if (msg.action !== 'berry' && !harvested.includes(msg.id)) harvested.push(msg.id);
@@ -80,6 +89,18 @@ wss.on('connection', (ws) => {
         const o = placed.find(o => o.id === msg.id);
         if (o) { o.fuel = msg.fuel; o.lit = true; }
         broadcast({ type: 'fuel', id: msg.id, fuel: msg.fuel }, id);
+      } else if (msg.type === 'loot') {
+        // забрали предмет из бочки — копим суммарно забранное и рассылаем
+        const b = looted[msg.id] || (looted[msg.id] = {});
+        b[msg.item] = (b[msg.item] || 0) + msg.count;
+        broadcast({ type: 'loot', id: msg.id, item: msg.item, count: msg.count }, id);
+      } else if (msg.type === 'name') {
+        const p = players.get(id);
+        if (p) { p.name = String(msg.name || '').slice(0, 16); broadcast({ type: 'name', id, name: p.name }, id); }
+      } else if (msg.type === 'chat') {
+        const p = players.get(id);
+        const text = String(msg.text || '').slice(0, 160).trim();
+        if (p && text) broadcast({ type: 'chat', id, name: p.name, text }, id);
       }
     } catch (_) {}
   });

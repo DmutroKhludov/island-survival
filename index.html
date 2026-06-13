@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Островок · ламповая выживалка</title>
-<link rel="stylesheet" href="style.css?v=6">
+<link rel="stylesheet" href="style.css?v=20">
 </head>
 <body>
   <div id="game-wrap">
@@ -43,16 +43,36 @@
     <!-- Прицел (вид от первого лица) -->
     <div id="crosshair"></div>
 
+    <!-- Эффект горения (когда стоишь в огне) -->
+    <div id="burn"></div>
+
+    <!-- Эффект холода (иней при падении тепла) -->
+    <div id="cold"></div>
+
+    <!-- Ники игроков над головами -->
+    <div id="nametags"></div>
+
     <!-- Подсказка действия -->
     <div id="prompt"></div>
 
     <!-- Лог сообщений -->
     <div id="log"></div>
 
+    <!-- Чат -->
+    <div id="chat-log"></div>
+    <input id="chat-input" type="text" maxlength="160" autocomplete="off" placeholder="Сообщение…  (Enter — отправить, Esc — отмена)">
+
+
     <!-- Меню крафта -->
     <div id="craft" class="hidden">
       <h2>Мастерская <small>(C — закрыть)</small></h2>
       <div id="craft-list"></div>
+    </div>
+
+    <!-- Лутбочка -->
+    <div id="loot" class="hidden">
+      <h2>📦 Бочка <small>(перетащи в инвентарь)</small></h2>
+      <div id="loot-grid" class="grid"></div>
     </div>
 
     <!-- Инвентарь (полный) -->
@@ -85,8 +105,10 @@
           <li><b>Лестницы у корабля</b> — подойди и жми <b>W</b> вверх / <b>S</b> вниз</li>
           <li><b>C</b> — мастерская (крафт)</li>
           <li><b>E</b> — инвентарь</li>
+          <li><b>T</b> — чат (Enter — отправить)</li>
           <li><b>1–9</b> — поставить предмет / использовать</li>
         </ul>
+        <input id="name-input" type="text" maxlength="16" autocomplete="off" placeholder="Твоё имя (увидят другие)">
         <button id="start-btn">Высадиться на берег</button>
       </div>
     </div>
@@ -109,6 +131,6 @@
     }
   }
   </script>
-  <script type="module" src="game.js?v=6"></script>
+  <script type="module" src="game.js?v=20"></script>
 </body>
 </html>
